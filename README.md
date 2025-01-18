@@ -14,7 +14,7 @@ A command-line interface for Kokoro text-to-speech synthesis, supporting multipl
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/kokoro-tts-cli
+git clone https://github.com/iplayfast/kokoro-tts-cli
 cd kokoro-tts-cli
 ```
 
