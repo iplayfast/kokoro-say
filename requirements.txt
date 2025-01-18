@@ -1,0 +1,5 @@
+kokoro-onnx[gpu]
+sounddevice
+pyinstaller
+torch
+requests
