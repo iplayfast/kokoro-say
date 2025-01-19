@@ -14,6 +14,10 @@ import argparse
 from kokoro_onnx import Kokoro
 import subprocess
 import psutil
+import io
+import numpy as np
+import requests
+import torch
 
 # Configure logging to write to a file
 logging.basicConfig(
@@ -30,6 +34,49 @@ LANGUAGES = [
     ("ko", "Korean"),
     ("cmn", "Mandarin Chinese")
 ]
+
+class VoiceFetcher:
+    def __init__(self):
+        self.voices = [
+            "af", "af_bella", "af_nicole", "af_sarah", "af_sky",
+            "am_adam", "am_michael", "bf_emma", "bf_isabella",
+            "bm_george", "bm_lewis"
+        ]
+        self.pattern = "https://huggingface.co/hexgrad/Kokoro-82M/resolve/main/voices/{voice}.pt"
+    
+    def fetch_voices(self, path: str = "voices.json") -> None:
+        """Fetch voices if voices.json doesn't exist"""
+        if os.path.exists(path):
+            return
+        
+        print("\nFirst-time setup: Downloading voice models...")
+        print("This may take several minutes but only needs to be done once.\n")
+        
+        voices_json = {}
+        for i, voice in enumerate(self.voices, 1):
+            url = self.pattern.format(voice=voice)
+            print(f"Downloading voice {i}/{len(self.voices)}: {voice}")
+            try:
+                r = requests.get(url)
+                r.raise_for_status()
+                content = io.BytesIO(r.content)
+                voice_data: np.ndarray = torch.load(content).numpy()
+                voices_json[voice] = voice_data.tolist()
+            except Exception as e:
+                print(f"Error downloading voice {voice}: {str(e)}")
+                if not voices_json:  # If no voices downloaded yet
+                    raise RuntimeError("Failed to download any voices. Please check your internet connection and try again.")
+                print("Continuing with downloaded voices...")
+                break
+        
+        if not voices_json:
+            raise RuntimeError("No voices were successfully downloaded")
+        
+        print("\nSaving voice data...")
+        with open(path, "w") as f:
+            json.dump(voices_json, f, indent=4)
+        print(f"Voice setup complete! Saved to {path}\n")
+
 
 
 def kill_all_daemons():
@@ -111,6 +158,16 @@ class TTSServer:
         self.lock = threading.Lock()
         self.running = True
         self.server = None
+        self.voice_fetcher = VoiceFetcher()
+
+        self.voice = voice
+        self.lang = lang
+        self.socket_path = socket_path or f"/tmp/tts_socket_{voice}_{lang}"
+        self.pid_file = pid_file or f"/tmp/tts_daemon_{voice}_{lang}.pid"
+        self.kokoro = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.server = None
 
     def daemonize(self):
         """Properly daemonize the process"""
@@ -169,9 +226,15 @@ class TTSServer:
             model_path = script_dir / "kokoro-v0_19.onnx"
             voices_path = script_dir / "voices.json"
             
-            if not model_path.exists() or not voices_path.exists():
-                raise FileNotFoundError("Required model files not found")
-                
+            # Ensure voices exist
+            self.voice_fetcher.fetch_voices(str(voices_path))
+            
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"Model file not found: {model_path}\n"
+                    "Please download it from: https://github.com/thewh1teagle/kokoro-onnx/releases"
+                )
+            
             self.kokoro = Kokoro(str(model_path), str(voices_path))
             logging.info(f"Kokoro model loaded for voice {self.voice} and language {self.lang}")
 
@@ -363,10 +426,16 @@ def main():
         kill_all_daemons()
         sys.exit(0)
 
-    # Create temporary Kokoro instance just to get voices (in parent process before any forking)
+    # Ensure voices are available before creating Kokoro instance
     script_dir = Path(__file__).parent.absolute()
-    model_path = script_dir / "kokoro-v0_19.onnx"
     voices_path = script_dir / "voices.json"
+    model_path = script_dir / "kokoro-v0_19.onnx"
+    
+    # Create voice fetcher and ensure voices exist
+    voice_fetcher = VoiceFetcher()
+    voice_fetcher.fetch_voices(str(voices_path))
+    
+    # Now create temporary Kokoro instance to get voices
     kokoro = Kokoro(str(model_path), str(voices_path))
     available_voices = sorted(list(kokoro.get_voices()))
     del kokoro  # Clean up the temporary instance
