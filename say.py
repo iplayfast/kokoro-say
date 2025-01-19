@@ -78,6 +78,46 @@ class VoiceFetcher:
         print(f"Voice setup complete! Saved to {path}\n")
 
 
+class ModelFetcher:
+    def __init__(self):
+        self.model_url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx"
+    
+    def fetch_model(self, path: str = "kokoro-v0_19.onnx") -> None:
+        """Fetch model if it doesn't exist"""
+        if os.path.exists(path):
+            return
+        
+        print("\nDownloading Kokoro model...")
+        print("This may take several minutes but only needs to be done once.\n")
+        
+        try:
+            r = requests.get(self.model_url)
+            r.raise_for_status()
+            with open(path, 'wb') as f:
+                f.write(r.content)
+            print(f"Model download complete! Saved to {path}\n")
+        except Exception as e:
+            raise RuntimeError(f"Failed to download model: {str(e)}\nURL: {self.model_url}")
+
+def ensure_model_and_voices(script_dir: Path):
+    """Ensure both model and voices exist before starting"""
+    model_path = script_dir / "kokoro-v0_19.onnx"
+    voices_path = script_dir / "voices.json"
+    
+    print("Checking required files...")
+    model_fetcher = ModelFetcher()
+    voice_fetcher = VoiceFetcher()
+    
+    try:
+        model_fetcher.fetch_model(str(model_path))
+        voice_fetcher.fetch_voices(str(voices_path))
+    except Exception as e:
+        print(f"\nError during setup: {str(e)}")
+        sys.exit(1)
+    
+    return model_path, voices_path
+
+
 
 def kill_all_daemons():
     """Kill all running TTS daemons"""
@@ -426,14 +466,9 @@ def main():
         kill_all_daemons()
         sys.exit(0)
 
-    # Ensure voices are available before creating Kokoro instance
+    # Ensure model and voices exist
     script_dir = Path(__file__).parent.absolute()
-    voices_path = script_dir / "voices.json"
-    model_path = script_dir / "kokoro-v0_19.onnx"
-    
-    # Create voice fetcher and ensure voices exist
-    voice_fetcher = VoiceFetcher()
-    voice_fetcher.fetch_voices(str(voices_path))
+    model_path, voices_path = ensure_model_and_voices(script_dir)
     
     # Now create temporary Kokoro instance to get voices
     kokoro = Kokoro(str(model_path), str(voices_path))
