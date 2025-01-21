@@ -1,10 +1,57 @@
 #!/bin/bash
 
-# Get the directory where the script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# Get the real directory by following symlinks
+SOURCE=${BASH_SOURCE[0]}
+while [ -L "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+    DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
+    SOURCE=$(readlink "$SOURCE")
+    # If $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+    [[ $SOURCE != /* ]] && SOURCE=$DIR/$SOURCE
+done
+SCRIPT_DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
 
-# Activate the virtual environment
-source "${SCRIPT_DIR}/venv/bin/activate"
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-# Run say.py with all arguments passed to this script
-python "${SCRIPT_DIR}/say.py" "$@"
+# Change to the script's real directory
+cd "$SCRIPT_DIR"
+
+# Create virtual environment if it doesn't exist
+if [ ! -d "$SCRIPT_DIR/venv" ]; then
+    echo "First time setup: Creating virtual environment..."
+    if ! command_exists python3; then
+        echo "Error: python3 is not installed"
+        exit 1
+    fi
+    python3 -m venv "$SCRIPT_DIR/venv"
+fi
+
+# Activate virtual environment
+source "$SCRIPT_DIR/venv/bin/activate"
+
+# Install dependencies if needed
+if [ ! -f "$SCRIPT_DIR/venv/.dependencies_installed" ]; then
+    echo "Installing Python dependencies..."
+    
+    # Check for system dependencies
+    if ! command_exists espeak; then
+        echo "Installing espeak..."
+        if command_exists apt-get; then
+            sudo apt-get update && sudo apt-get install -y espeak
+        elif command_exists brew; then
+            brew install espeak
+        else
+            echo "Error: espeak not found and unable to install automatically."
+            echo "Please install espeak using your system's package manager."
+            exit 1
+        fi
+    fi
+    
+    pip install -r "$SCRIPT_DIR/requirements.txt"
+    touch "$SCRIPT_DIR/venv/.dependencies_installed"
+fi
+
+# Run the Python script
+python "$SCRIPT_DIR/say.py" "$@"
