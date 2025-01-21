@@ -33,16 +33,13 @@ class VoiceServer(UnixSocketServer):
         self.lang = lang
         self.model_socket = MODEL_SERVER_SOCKET
         
-        # Playback control - initialize these first
+        # Playback control
         self.current_playback_lock = threading.Lock()
         self.current_playback = None
         self.stream = None
         
         # Running state
         self.running = True
-        
-        # Audio primer
-        self.primer_word = "hmm"
         
         self.logger.debug("Instance variables initialized")
 
@@ -62,11 +59,12 @@ class VoiceServer(UnixSocketServer):
         signal.signal(signal.SIGCHLD, self.handle_child)
         
         self.logger.info(f"VoiceServer initialized for voice={voice}, lang={lang}")
-
     def _start_audio_playback(self, samples: np.ndarray, sample_rate: int) -> None:
-        """Initialize and start audio playback"""
+        """Initialize and start audio playback with warm-up tone"""
         try:
-            # Configure sounddevice for main playback
+            self.logger.debug("Starting audio playback setup")
+            
+            # Configure sounddevice
             sd.default.reset()
             sd.default.device = None
             sd.default.latency = 'high'
@@ -74,39 +72,120 @@ class VoiceServer(UnixSocketServer):
             sd.default.channels = 1
             sd.default.samplerate = sample_rate
             
-            # Define callbacks
+            device_info = sd.query_devices(sd.default.device)
+            self.logger.debug(f"Using audio device: {device_info}")
+            
+            # Create and start stream
+            self.logger.debug("Creating output stream")
+            self.stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype=samples.dtype,
+                callback=lambda *args: self.logger.debug(f"Audio callback: {args}")
+            )
+            
+            self.logger.debug("Starting stream")
+            self.stream.start()
+            
+            # Create and play warm-up tone
+            duration = 0.1  # seconds
+            frequency = 21  # Hz
+            t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+            warmup_tone = 0.1 * np.sin(2 * np.pi * frequency * t)
+            
+            self.logger.debug("Playing warm-up tone")
+            sd.play(warmup_tone, sample_rate, blocking=True)
+            self.logger.debug("Warm-up tone complete")
+            
+            sd.wait()
+            self.logger.debug("Starting main audio playback")
+            
+            sd.play(samples, sample_rate, blocking=False)
+            self.current_playback = True
+            
+            self.logger.debug("Audio playback started successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Error in audio playback: {e}", exc_info=True)
+            raise
+    
+        
+    def _start_audio_playback1(self, samples: np.ndarray, sample_rate: int) -> None:
+        """Initialize and start audio playback"""
+        try:
+            self.logger.debug("Starting audio playback setup")
+            
+            # Log input state
+            self.logger.debug(f"Input samples shape: {samples.shape}, dtype: {samples.dtype}")
+            self.logger.debug(f"Sample rate: {sample_rate}")
+            self.logger.debug(f"Sample range: min={np.min(samples)}, max={np.max(samples)}")
+            
+            # Get available audio devices
+            devices = sd.query_devices()
+            self.logger.debug(f"Available audio devices:\n{devices}")
+            
+            # Stop any existing playback
+            sd.stop()
+            if self.stream:
+                self.stream.close()
+                self.stream = None
+                self.logger.debug("Closed existing stream")
+            
+            # Configure sounddevice
+            sd.default.reset()
+            sd.default.device = None  # Use system default
+            sd.default.latency = 'high'
+            sd.default.dtype = np.float32
+            sd.default.channels = 1
+            sd.default.samplerate = sample_rate
+            
+            current_device = sd.query_devices(sd.default.device)
+            self.logger.debug(f"Selected device settings: {current_device}")
+            
+            # Normalize samples
+            max_amp = np.max(np.abs(samples))
+            if max_amp > 0:
+                samples = 0.95 * (samples / max_amp)
+                self.logger.debug(f"Normalized sample range: min={np.min(samples)}, max={np.max(samples)}")
+            
+            # Create stream with logging callbacks
+            def stream_callback(outdata, frames, time, status):
+                if status:
+                    self.logger.warning(f"Stream callback status: {status}")
+                    
             def finished_callback():
-                self.logger.debug("Audio finished")
+                self.logger.debug("Stream finished callback triggered")
                 if self.stream:
                     self.stream.close()
                     self.stream = None
                 self.current_playback = False
             
-            # Create output stream
+            self.logger.debug("Creating output stream")
             self.stream = sd.OutputStream(
                 samplerate=sample_rate,
                 channels=1,
-                dtype=samples.dtype,
+                dtype=np.float32,
+                callback=stream_callback,
                 finished_callback=finished_callback
             )
             
-            # Start stream
+            self.logger.debug("Starting stream")
             self.stream.start()
             
-            # Small wait after stream start
-            time.sleep(0.1)
+            if not self.stream.active:
+                raise RuntimeError("Stream failed to start")
             
-            # Start playback
+            self.logger.debug("Starting audio playback")
             sd.play(samples, sample_rate, blocking=False)
             self.current_playback = True
             
-            self.logger.debug(
-                f"Started playback: {len(samples)} samples "
-                f"at {sample_rate}Hz"
-            )
+            self.logger.debug("Audio playback started successfully")
+            
+            # Keep main thread alive briefly to ensure playback starts
+            time.sleep(0.1)
             
         except Exception as e:
-            self.logger.error(f"Error in audio playback: {e}")
+            self.logger.error(f"Error in audio playback: {e}", exc_info=True)
             raise
 
     def handle_client(self, conn: socket.socket) -> None:
@@ -119,12 +198,8 @@ class VoiceServer(UnixSocketServer):
 
             # Receive request from client
             request = self.receive_request(conn)
-            original_text = request.get("text", "")
-            self.logger.debug(f"Processing request: {original_text[:50]}...")
-            
-            # Add primer word to text
-            modified_text = f"{self.primer_word} {original_text}"
-            self.logger.debug(f"Modified text with primer: {modified_text[:50]}...")
+            text = request.get("text", "")
+            self.logger.debug(f"Processing request: {text[:50]}...")
 
             # Connect to model server
             model_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -133,44 +208,41 @@ class VoiceServer(UnixSocketServer):
             
             # Forward request to model server
             self.send_request(model_sock, {
-                "text": modified_text,
+                "text": text,
                 "voice": self.voice,
                 "lang": self.lang
             })
             
             # Read response from model server
             response = self.receive_response(model_sock)
+            self.logger.debug("Received response from model server")
             
             if response.get("status") == "success":
                 try:
-                    # Stop any current playback before starting new one
-                    self.stop_current_playback()
-                    
-                    # Process audio data
                     samples = np.array(response["samples"], dtype=np.float32)
                     sample_rate = int(response["sample_rate"])
+                    self.logger.debug(f"Processing audio data: shape={samples.shape}, rate={sample_rate}")
                     
                     with self.current_playback_lock:
                         self._start_audio_playback(samples, sample_rate)
                     
-                    # Send success response to client
                     self.send_response(conn, {
                         "status": "success",
                         "message": "Audio playback started"
                     })
                     
                 except Exception as e:
-                    self.logger.error(f"Error processing audio: {e}")
+                    self.logger.error(f"Error processing audio: {e}", exc_info=True)
                     self.send_response(conn, {
                         "status": "error",
                         "message": f"Audio processing error: {str(e)}"
                     })
             else:
-                # Forward error from model server
+                self.logger.error(f"Model server error: {response.get('message', 'Unknown error')}")
                 self.send_response(conn, response)
 
         except Exception as e:
-            self.logger.error(f"Error handling client: {e}")
+            self.logger.error(f"Error handling client: {e}", exc_info=True)
             try:
                 self.send_response(conn, {
                     "status": "error",
@@ -179,7 +251,6 @@ class VoiceServer(UnixSocketServer):
             except:
                 pass
         finally:
-            # Clean up connections
             if model_sock:
                 try:
                     model_sock.close()
