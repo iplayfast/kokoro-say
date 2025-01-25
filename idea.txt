@@ -1,5 +1,6 @@
 The project is called say and is a speech synthisis system.
-The idea here is to conserve memory. 
+The idea here is to conserve memory and time by loading only voices that are needed and having them available for subsequent uses. 
+
 when a voice+lang is used  the socket_path = f"{SOCKET_BASE_PATH}_{voice}_{lang}" which specifies the server that is serving this particular voice and language
 we will call this a voice_server.
 
@@ -14,7 +15,7 @@ The steps that follow are:
 
   2. when an instruction to say something appears at a voice_server, (assuming it has been previously set up in step 1) it 
 	a. checks to see if something is already being said. If so it needs to stop saying it and clear any remaining data. If it is streamed, this must be hanndled correctly. 
-	b. Now that voice_server is no longer busy it should then process the info.
+	b. Now that voice_server is no longer busy it should then process the new info
 
 For example:
 a fresh start
@@ -51,3 +52,8 @@ python say.py --voice 2 "hello 3"
 		
 
 In this way you can see that once in memory, the servers do not need to reload and are resused. An individual voice can only say one thing at a time, althought this does not preclude two different voices from saying something at the same time.
+
+
+
+say.py implements these ideas fairly well, 
+api.py needs to be improved.

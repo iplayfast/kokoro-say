@@ -1,8 +1,20 @@
-src/
-├── __init__.py
-├── base_server.py     # New file
-├── constants.py
-├── fetchers.py
-├── model_server.py    # Updated
-├── utils.py          # Updated
-└── voice_server.py   # Renamed from voice-server.py
+.
+├── api.py
+├── directory.layout
+├── idea.txt
+├── pytest.ini
+├── README.md
+├── requirements.txt
+├── say
+├── say.py
+├── src
+│   ├── base_server.py
+│   ├── constants.py
+│   ├── fetchers.py
+│   ├── __init__.py
+│   ├── model_server.py
+│   ├── utils.py
+│   └── voice_server.py
+├── tests
+│   └── test_api.py
+└── tests-md.md

@@ -8,9 +8,10 @@ import argparse
 import socket
 import time
 import multiprocessing
-import threading
-from typing import List
+import numpy as np
+import sounddevice as sd
 from pathlib import Path
+from typing import Optional, List
 
 from src.voice_server import VoiceServer
 from src.fetchers import VoiceFetcher
@@ -71,147 +72,21 @@ def setup_logging(verbose: bool = False):
     logging.getLogger('sounddevice').setLevel(logging.WARNING)
     logging.getLogger('numpy').setLevel(logging.WARNING)
 
-
 # Initialize logging early
 setup_logging()
 logger = logging.getLogger(__name__)
 
-def show_help(voices: List[str]) -> None:
-    """
-    Display help message showing available voices and languages
-    
-    Args:
-        voices: List of available voice names
-    """
-    print("\nAvailable voices:")
-    for i, voice in enumerate(voices, 1):
-        print(f"  {i:2d}. {voice}")
-    
-    print("\nAvailable languages:")
-    for i, (code, name) in enumerate(LANGUAGES, 1):
-        print(f"  {i:2d}. {code:6s} - {name}")
-    
-    print("\nUsage examples:")
-    cmd = os.path.basename(sys.argv[0])
-    print(f"  1. List available voices and languages:")
-    print(f"     {cmd} --help")
-    print(f"\n  2. Using voice and language by name/code:")
-    print(f"     {cmd} --voice {voices[0]} --lang en-us \"Hello World\"")
-    print(f"\n  3. Using voice and language by number:")
-    print(f"     {cmd} --voice 1 --lang 3 \"Bonjour le monde\"")
-    print(f"\n  4. Using pipe with mixed selection:")
-    print(f"     echo \"こんにちは\" | {cmd} --voice 1 --lang ja")
-
-def start_server_process(voice: str, lang: str) -> None:
-    """Start the VoiceServer in a new process"""
-    try:
-        logger.debug(f"Starting VoiceServer process for voice {voice} and language {lang}")
-        server = VoiceServer(voice, lang)
-        logger.debug("VoiceServer instance created")        
-        server.start()
-    except Exception as e:
-        logger.error(f"Failed to start VoiceServer: {e}", exc_info=True)
-        sys.exit(1)
-
-def send_request(text: str, voice: str, lang: str) -> None:
-    """Send text to existing daemon or start a new one"""
-    socket_path = f"{SOCKET_BASE_PATH}_{voice}_{lang}"
-    logger.debug(f"Using socket path: {socket_path}")
-    
-    # Ensure model server is running
-    logger.debug("Ensuring model server is running")
-    if not ensure_model_server_running():
-        logger.error("Failed to start model server")
-        sys.exit(1)
-    
-    # If voice server not running, start it
-    if not os.path.exists(socket_path):
-        logger.debug(f"Starting new voice server for {voice}_{lang}")
-        process = multiprocessing.Process(
-            target=start_server_process,
-            args=(voice, lang)
-        )
-        process.start()
-        
-        # Wait for socket to appear
-        start_time = time.time()
-        while not os.path.exists(socket_path):
-            if time.time() - start_time > 30:
-                logger.error("Timeout waiting for voice server to start")
-                sys.exit(1)
-            time.sleep(0.1)
-    
-    try:
-        # Connect to voice server
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(30)
-        
-        # Try to connect multiple times
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                client.connect(socket_path)
-                logger.debug("Connected to voice server")
-                break
-            except socket.error as e:
-                if attempt == max_retries - 1:
-                    raise
-                logger.debug(f"Connection attempt {attempt + 1} failed, retrying...")
-                time.sleep(1)
-        
-        # Prepare and send request
-        request = {
-            "text": text,
-            "voice": voice,
-            "lang": lang
-        }
-        request_data = json.dumps(request).encode('utf-8')
-        length_prefix = f"{len(request_data):08d}\n".encode('utf-8')
-        client.sendall(length_prefix + request_data)
-        logger.debug("Request sent, waiting for response")
-        
-        # Read response length
-        length_data = client.recv(9)
-        if not length_data:
-            raise RuntimeError("Server closed connection while reading length")
-        
-        expected_length = int(length_data.decode().strip())
-        logger.debug(f"Expecting response of length {expected_length}")
-        
-        # Read response data with timeout tracking
-        response_data = bytearray()
-        remaining = expected_length
-        start_time = time.time()
-        
-        while remaining > 0:
-            if time.time() - start_time > 30:
-                raise socket.timeout("Timeout while reading response data")
-            
-            chunk = client.recv(min(8192, remaining))
-            if not chunk:
-                raise RuntimeError("Server closed connection while reading response")
-            response_data.extend(chunk)
-            remaining -= len(chunk)
-        
-        # Parse and handle response
-        response = json.loads(response_data.decode())
-        logger.debug(f"Received response: (not shown because it's too long)") #{response}")
-        
-        if response.get("status") == "error":
-            logger.error(f"Server error: {response.get('message')}")
-            sys.exit(1)
-            
-    except Exception as e:
-        logger.error(f"Error communicating with voice server: {e}")
-        sys.exit(1)
-    finally:
-        try:
-            client.close()
-        except:
-            pass
-        
 def main():
     try:
+        # Uncomment the following lines for default debugging
+        # sys.argv = [
+        #     'say.py', 
+        #     '--voice', '3',   # Default voice
+        #     '--lang', 'en-gb', # Default language 
+        #     '--log',           # Enable detailed logging
+        #     'hello world'      # Default text
+        # ]
+
         logger.debug("Starting main function")
         if sys.platform != 'win32':
             multiprocessing.set_start_method('spawn')
@@ -225,9 +100,17 @@ def main():
         parser.add_argument('--list', action='store_true', help='List available voices and languages')
         parser.add_argument('--kill', action='store_true', help='Kill all running TTS daemons')
         parser.add_argument('--log', action='store_true', help='Enable detailed logging')
-        parser.add_argument('text', nargs='*', help='Text to speak')
+        parser.add_argument('--output', help='Output WAV file path')
+        parser.add_argument('text', nargs='*', help='Text to speak', default='Hello, world!')
         
         args = parser.parse_args()
+        
+        # Uncomment to force default debugging parameters
+        # args.voice = '3'
+        # args.lang = 'en-gb'
+        # args.log = True
+        args.text = ['hello world']
+        
         setup_logging(args.log)
         logger.debug(f"Parsed arguments: {args}")
 
@@ -243,6 +126,12 @@ def main():
             logger.debug("Creating voice fetcher to get available voices")
             voice_fetcher = VoiceFetcher()
             available_voices = sorted(voice_fetcher.get_available_voices())
+            
+            # Uncomment for full voice details debugging
+            # print("Full Voice Details:")
+            # for idx, voice in enumerate(available_voices):
+            #     print(f"{idx+1}: {voice}")
+            
             logger.debug(f"Available voices: {available_voices}")
         except Exception as e:
             logger.error(f"Error initializing TTS system: {e}", exc_info=True)
@@ -274,13 +163,94 @@ def main():
             show_help(available_voices)
             sys.exit(1)
         
-        logger.debug(f"Processing text: '{text}' with voice: {voice}, language: {lang}")
-        send_request(text, voice, lang)
+        # Uncomment for additional debugging output
+        # print(f"Debug: Selected Voice '{voice}', Language '{lang}'")
+        # print(f"Debug: Text to process: '{text}'")
         
+        logger.debug(f"Processing text: '{text}' with voice: {voice}, language: {lang}")
+        
+        # Ensure model server is running
+        logger.debug("Ensuring model server is running")
+        if not ensure_model_server_running():
+            logger.error("Failed to start model server")
+            sys.exit(1)
+            
+        socket_path = f"{SOCKET_BASE_PATH}_{voice}_{lang}"
+        logger.debug(f"Using socket path: {socket_path}")
+        
+        if not os.path.exists(socket_path):
+            logger.debug(f"Starting new voice server for {voice}_{lang}")
+            process = multiprocessing.Process(
+                target=start_server_process,
+                args=(voice, lang)
+            )
+            process.start()
+            logger.debug(f"Started voice server process {process.pid}")
+            
+            # Wait for socket to appear
+            start_time = time.time()
+            while not os.path.exists(socket_path):
+                if time.time() - start_time > 30:
+                    logger.error("Timeout waiting for voice server")
+                    sys.exit(1)
+                time.sleep(0.1)
+            logger.debug("Voice server socket is ready")
+        
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(30)
+            client.connect(socket_path)
+            logger.debug("Connected to voice server")
+
+            request = {
+                "text": text,
+                "voice": voice,
+                "lang": lang,
+                "format": "wav" if args.output else "audio"
+            }
+            
+            # Uncomment to inspect request details before sending
+            # print("Debug Request Details:")
+            # import json
+            # print(json.dumps(request, indent=2))
+            
+            request_data = json.dumps(request).encode('utf-8')
+            length_prefix = f"{len(request_data):08d}\n".encode('utf-8')
+            client.sendall(length_prefix + request_data)
+            
+            length_data = client.recv(9)
+            if not length_data:
+                raise RuntimeError("Server closed connection while reading length")
+            
+            response = receive_server_response(client, length_data)
+            if response.get("status") != "success":
+                raise RuntimeError(response.get("message", "Unknown error"))
+                
+            if args.output:
+                if "wav_data" in response:
+                    with open(args.output, 'wb') as f:
+                        f.write(response["wav_data"])
+                    logger.info(f"Audio saved to {args.output}")
+                else:
+                    raise RuntimeError("No WAV data received")
+            elif response.get("message")=="Audio playback started":
+                # Audio is being handled by voice server
+                time.sleep(0.1) # small delay to ensure playback starts
+            else:
+                raise RuntimeError("No audio data received")
+            
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            sys.exit(1)
+        finally:
+            try:
+                client.close()
+            except:
+                pass
+            
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         try:
-            import sounddevice as sd
             sd.stop()
         except:
             pass
@@ -289,6 +259,9 @@ def main():
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
+
+# Add other functions (start_server_process, show_help, receive_server_response) 
+# as they were in the original script...
 
 if __name__ == "__main__":
     main()

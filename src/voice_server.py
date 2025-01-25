@@ -195,17 +195,18 @@ class VoiceServer(UnixSocketServer):
             conn.setblocking(True)
             conn.settimeout(SERVER_TIMEOUT)
             self.logger.debug("Start handling client connection")
-
+    
             # Receive request from client
             request = self.receive_request(conn)
             text = request.get("text", "")
+            output_format = request.get("format", "audio")
             self.logger.debug(f"Processing request: {text[:50]}...")
 
             # Connect to model server
             model_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             model_sock.settimeout(SERVER_TIMEOUT)
             model_sock.connect(self.model_socket)
-            
+        
             # Forward request to model server
             self.send_request(model_sock, {
                 "text": text,
@@ -222,14 +223,32 @@ class VoiceServer(UnixSocketServer):
                     samples = np.array(response["samples"], dtype=np.float32)
                     sample_rate = int(response["sample_rate"])
                     self.logger.debug(f"Processing audio data: shape={samples.shape}, rate={sample_rate}")
+                
+                    if output_format == "wav":
+                        self.logger.debug("Generating WAV file output")
+                        import io
+                        import soundfile as sf
+                        wav_buffer = io.BytesIO()
+                        sf.write(wav_buffer, samples, sample_rate, format='WAV')
+                        wav_data = wav_buffer.getvalue()
+                        self.logger.debug(f"Generated WAV file of {len(wav_data)} bytes")
                     
-                    with self.current_playback_lock:
-                        self._start_audio_playback(samples, sample_rate)
+                        self.send_response(conn, {
+                            "status": "success",
+                            "samples": samples.tolist(),
+                            "sample_rate": sample_rate,
+                            "wav_data": wav_data
+                        })
+                        self.logger.debug("WAV data sent to client")
+                    else:
+                        self.logger.debug("Starting audio playback")
+                        with self.current_playback_lock:
+                            self._start_audio_playback(samples, sample_rate)
                     
-                    self.send_response(conn, {
-                        "status": "success",
-                        "message": "Audio playback started"
-                    })
+                        self.send_response(conn, {
+                            "status": "success",
+                            "message": "Audio playback started"
+                        })
                     
                 except Exception as e:
                     self.logger.error(f"Error processing audio: {e}", exc_info=True)
@@ -257,7 +276,7 @@ class VoiceServer(UnixSocketServer):
                 except:
                     pass
             try:
-                conn.close()
+                    conn.close()
             except:
                 pass
 

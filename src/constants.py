@@ -24,6 +24,7 @@ MODEL_PID_FILE = "/tmp/model_server.pid"
 DEFAULT_VOICE = "1"
 DEFAULT_LANG = "en-us"
 
+
 # Audio processing constants
 MAX_CHUNK_SIZE = 500
 SENTENCE_END_MARKERS = {'.', '!', '?'}
