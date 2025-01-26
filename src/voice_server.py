@@ -4,358 +4,252 @@ import os
 import sys
 import json
 import socket
-import select
-import threading
 import logging
 import time
 import signal
-import sounddevice as sd
 import numpy as np
+import sounddevice as sd
+from typing import Optional, Dict, Any
 from pathlib import Path
-from typing import Optional, Tuple, Any, Dict
 
-from .base_server import UnixSocketServer
-from .constants import (
-    SOCKET_BASE_PATH,
-    PID_BASE_PATH,
-    MODEL_SERVER_SOCKET,
-    SERVER_TIMEOUT
-)
-from .constants import MAX_CHUNK_SIZE, SENTENCE_END_MARKERS
+logger = logging.getLogger(__name__)
 
-class VoiceServer(UnixSocketServer):
-    """Server for handling voice-specific TTS requests"""
-    
-    def _initialize_instance_vars(self, voice: str, lang: str):
-        """Initialize all instance variables"""
-        # Voice-specific attributes
+class VoiceServer:
+    def __init__(
+        self,
+        voice: str,
+        lang: str,
+        port: int,
+        model_host: str = "127.0.0.1",
+        model_port: int = 5000
+    ):
         self.voice = voice
         self.lang = lang
-        self.model_socket = MODEL_SERVER_SOCKET
-        
-        # Playback control
-        self.current_playback_lock = threading.Lock()
-        self.current_playback = None
-        self.stream = None
-        
-        # Running state
+        self.port = port
+        self.host = "127.0.0.1"
+        self.model_host = model_host
+        self.model_port = model_port
+        self.socket: Optional[socket.socket] = None
         self.running = True
+        self.current_stream: Optional[sd.OutputStream] = None
         
-        self.logger.debug("Instance variables initialized")
+    def register_with_model_server(self) -> bool:
+        """Register this voice server with the model server"""
+        try:
+            with socket.create_connection((self.model_host, self.model_port), timeout=5) as conn:
+                request = {
+                    "command": "register",
+                    "voice": self.voice,
+                    "lang": self.lang,
+                    "port": self.port
+                }
+                data = json.dumps(request).encode()
+                length_prefix = f"{len(data):08d}\n".encode()
+                conn.sendall(length_prefix + data)
+                
+                length_data = conn.recv(9)
+                expected_length = int(length_data.decode().strip())
+                response_data = bytearray()
+                remaining = expected_length
+                
+                while remaining > 0:
+                    chunk = conn.recv(min(8192, remaining))
+                    if not chunk:
+                        break
+                    response_data.extend(chunk)
+                    remaining -= len(chunk)
+                
+                response = json.loads(response_data.decode())
+                return response.get("status") == "success"
+                
+        except Exception as e:
+            logger.error(f"Failed to register with model server: {e}")
+            return False
+            
+    def stop_current_stream(self) -> None:
+        """Safely stop the current audio stream if one exists"""
+        if self.current_stream:
+            try:
+                self.current_stream.stop()
+                self.current_stream.close()
+            except Exception as e:
+                logger.error(f"Error stopping stream: {e}")
+            finally:
+                self.current_stream = None
 
-    def __init__(self, voice: str, lang: str):
-        """Initialize voice server"""
-        # Calculate paths
-        socket_path = f"{SOCKET_BASE_PATH}_{voice}_{lang}"
-        pid_file = f"{PID_BASE_PATH}_{voice}_{lang}.pid"
-        
-        # Initialize base server
-        super().__init__(socket_path, pid_file)
-        
-        # Initialize instance variables
-        self._initialize_instance_vars(voice, lang)
-        
-        # Set up signal handlers
-        signal.signal(signal.SIGCHLD, self.handle_child)
-        
-        self.logger.info(f"VoiceServer initialized for voice={voice}, lang={lang}")
-    def _start_audio_playback(self, samples: np.ndarray, sample_rate: int) -> None:
-        """Initialize and start audio playback with warm-up tone"""
+    def send_to_model_server(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Send request to model server and return response"""
         try:
-            self.logger.debug("Starting audio playback setup")
-            
-            # Configure sounddevice
-            sd.default.reset()
-            sd.default.device = None
-            sd.default.latency = 'high'
-            sd.default.dtype = samples.dtype
-            sd.default.channels = 1
-            sd.default.samplerate = sample_rate
-            
-            device_info = sd.query_devices(sd.default.device)
-            self.logger.debug(f"Using audio device: {device_info}")
-            
-            # Create and start stream
-            self.logger.debug("Creating output stream")
-            self.stream = sd.OutputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype=samples.dtype,
-                callback=lambda *args: self.logger.debug(f"Audio callback: {args}")
-            )
-            
-            self.logger.debug("Starting stream")
-            self.stream.start()
-            
-            # Create and play warm-up tone
-            duration = 0.1  # seconds
-            frequency = 21  # Hz
-            t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
-            warmup_tone = 0.1 * np.sin(2 * np.pi * frequency * t)
-            
-            self.logger.debug("Playing warm-up tone")
-            sd.play(warmup_tone, sample_rate, blocking=True)
-            self.logger.debug("Warm-up tone complete")
-            
-            sd.wait()
-            self.logger.debug("Starting main audio playback")
-            
-            sd.play(samples, sample_rate, blocking=False)
-            self.current_playback = True
-            
-            self.logger.debug("Audio playback started successfully")
-            
+            with socket.create_connection((self.model_host, self.model_port), timeout=30) as conn:
+                data = json.dumps(request).encode()
+                length_prefix = f"{len(data):08d}\n".encode()
+                conn.sendall(length_prefix + data)
+                
+                length_data = conn.recv(9)
+                expected_length = int(length_data.decode().strip())
+                response_data = bytearray()
+                remaining = expected_length
+                
+                while remaining > 0:
+                    chunk = conn.recv(min(8192, remaining))
+                    if not chunk:
+                        break
+                    response_data.extend(chunk)
+                    remaining -= len(chunk)
+                
+                return json.loads(response_data.decode())
+                
         except Exception as e:
-            self.logger.error(f"Error in audio playback: {e}", exc_info=True)
-            raise
-    
-        
-    def _start_audio_playback1(self, samples: np.ndarray, sample_rate: int) -> None:
-        """Initialize and start audio playback"""
-        try:
-            self.logger.debug("Starting audio playback setup")
-            
-            # Log input state
-            self.logger.debug(f"Input samples shape: {samples.shape}, dtype: {samples.dtype}")
-            self.logger.debug(f"Sample rate: {sample_rate}")
-            self.logger.debug(f"Sample range: min={np.min(samples)}, max={np.max(samples)}")
-            
-            # Get available audio devices
-            devices = sd.query_devices()
-            self.logger.debug(f"Available audio devices:\n{devices}")
-            
-            # Stop any existing playback
-            sd.stop()
-            if self.stream:
-                self.stream.close()
-                self.stream = None
-                self.logger.debug("Closed existing stream")
-            
-            # Configure sounddevice
-            sd.default.reset()
-            sd.default.device = None  # Use system default
-            sd.default.latency = 'high'
-            sd.default.dtype = np.float32
-            sd.default.channels = 1
-            sd.default.samplerate = sample_rate
-            
-            current_device = sd.query_devices(sd.default.device)
-            self.logger.debug(f"Selected device settings: {current_device}")
-            
-            # Normalize samples
-            max_amp = np.max(np.abs(samples))
-            if max_amp > 0:
-                samples = 0.95 * (samples / max_amp)
-                self.logger.debug(f"Normalized sample range: min={np.min(samples)}, max={np.max(samples)}")
-            
-            # Create stream with logging callbacks
-            def stream_callback(outdata, frames, time, status):
-                if status:
-                    self.logger.warning(f"Stream callback status: {status}")
-                    
-            def finished_callback():
-                self.logger.debug("Stream finished callback triggered")
-                if self.stream:
-                    self.stream.close()
-                    self.stream = None
-                self.current_playback = False
-            
-            self.logger.debug("Creating output stream")
-            self.stream = sd.OutputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype=np.float32,
-                callback=stream_callback,
-                finished_callback=finished_callback
-            )
-            
-            self.logger.debug("Starting stream")
-            self.stream.start()
-            
-            if not self.stream.active:
-                raise RuntimeError("Stream failed to start")
-            
-            self.logger.debug("Starting audio playback")
-            sd.play(samples, sample_rate, blocking=False)
-            self.current_playback = True
-            
-            self.logger.debug("Audio playback started successfully")
-            
-            # Keep main thread alive briefly to ensure playback starts
-            time.sleep(0.1)
-            
-        except Exception as e:
-            self.logger.error(f"Error in audio playback: {e}", exc_info=True)
+            logger.error(f"Error communicating with model server: {e}")
             raise
 
     def handle_client(self, conn: socket.socket) -> None:
-        """Handle requests from clients"""
-        model_sock = None
+        """Handle incoming client connection"""
         try:
-            conn.setblocking(True)
-            conn.settimeout(SERVER_TIMEOUT)
-            self.logger.debug("Start handling client connection")
-    
-            # Receive request from client
-            request = self.receive_request(conn)
-            text = request.get("text", "")
-            output_format = request.get("format", "audio")
-            self.logger.debug(f"Processing request: {text[:50]}...")
-
-            # Connect to model server
-            model_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            model_sock.settimeout(SERVER_TIMEOUT)
-            model_sock.connect(self.model_socket)
-        
-            # Forward request to model server
-            self.send_request(model_sock, {
-                "text": text,
-                "voice": self.voice,
-                "lang": self.lang
-            })
-            
-            # Read response from model server
-            response = self.receive_response(model_sock)
-            self.logger.debug("Received response from model server")
-            
-            if response.get("status") == "success":
-                try:
-                    samples = np.array(response["samples"], dtype=np.float32)
-                    sample_rate = int(response["sample_rate"])
-                    self.logger.debug(f"Processing audio data: shape={samples.shape}, rate={sample_rate}")
+            length_data = conn.recv(9)
+            if not length_data:
+                return
                 
-                    if output_format == "wav":
-                        self.logger.debug("Generating WAV file output")
-                        import io
-                        import soundfile as sf
-                        wav_buffer = io.BytesIO()
-                        sf.write(wav_buffer, samples, sample_rate, format='WAV')
-                        wav_data = wav_buffer.getvalue()
-                        self.logger.debug(f"Generated WAV file of {len(wav_data)} bytes")
+            expected_length = int(length_data.decode().strip())
+            data = bytearray()
+            remaining = expected_length
+            
+            while remaining > 0:
+                chunk = conn.recv(min(8192, remaining))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                remaining -= len(chunk)
+            
+            request = json.loads(data.decode())
+            
+            # Handle exit command
+            if request.get("command") == "exit":
+                logger.info("Received exit command")
+                self.stop_current_stream()
+                response = {"status": "success", "message": "Server shutting down"}
+                response_data = json.dumps(response).encode()
+                length_prefix = f"{len(response_data):08d}\n".encode()
+                conn.sendall(length_prefix + response_data)
+                self.running = False
+                return
+            
+            # Handle stop command
+            if request.get("command") == "stop":
+                logger.info("Received stop command")
+                self.stop_current_stream()
+                response = {"status": "success", "message": "Playback stopped"}
+                response_data = json.dumps(response).encode()
+                length_prefix = f"{len(response_data):08d}\n".encode()
+                conn.sendall(length_prefix + response_data)
+                return
+            
+            # Handle text-to-speech request
+            if "text" in request:
+                # Stop any current playback
+                self.stop_current_stream()
+                
+                # Add voice and language to request
+                request["voice"] = self.voice
+                request["lang"] = self.lang
+                
+                # Forward request to model server
+                response = self.send_to_model_server(request)
+                
+                if response.get("status") == "success":
+                    # Convert samples back to numpy array
+                    samples = np.array(response["samples"])
+                    sample_rate = response["sample_rate"]
                     
-                        self.send_response(conn, {
-                            "status": "success",
-                            "samples": samples.tolist(),
-                            "sample_rate": sample_rate,
-                            "wav_data": wav_data
-                        })
-                        self.logger.debug("WAV data sent to client")
-                    else:
-                        self.logger.debug("Starting audio playback")
-                        with self.current_playback_lock:
-                            self._start_audio_playback(samples, sample_rate)
-                    
-                        self.send_response(conn, {
-                            "status": "success",
-                            "message": "Audio playback started"
-                        })
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing audio: {e}", exc_info=True)
-                    self.send_response(conn, {
-                        "status": "error",
-                        "message": f"Audio processing error: {str(e)}"
-                    })
-            else:
-                self.logger.error(f"Model server error: {response.get('message', 'Unknown error')}")
-                self.send_response(conn, response)
-
+                    if request.get("play", True):
+                        # Create and start new audio stream
+                        self.current_stream = sd.OutputStream(
+                            samplerate=sample_rate,
+                            channels=1,
+                            callback=None,
+                            finished_callback=self.stop_current_stream,
+                            blocksize=1024
+                        )
+                        self.current_stream.start()
+                        self.current_stream.write(samples,non_blocking=True)
+                
+                # Send response back to client
+                response_data = json.dumps(response).encode()
+                length_prefix = f"{len(response_data):08d}\n".encode()
+                conn.sendall(length_prefix + response_data)
+                
         except Exception as e:
-            self.logger.error(f"Error handling client: {e}", exc_info=True)
+            logger.error(f"Error handling client: {e}")
+            error_response = {
+                "status": "error",
+                "message": str(e)
+            }
             try:
-                self.send_response(conn, {
-                    "status": "error",
-                    "message": str(e)
-                })
+                response_data = json.dumps(error_response).encode()
+                length_prefix = f"{len(response_data):08d}\n".encode()
+                conn.sendall(length_prefix + response_data)
             except:
                 pass
         finally:
-            if model_sock:
-                try:
-                    model_sock.close()
-                except:
-                    pass
-            try:
-                    conn.close()
-            except:
-                pass
+            conn.close()
 
-    def stop_current_playback(self):
-        """Safely stop any current audio playback"""
-        if hasattr(self, 'current_playback_lock'):
-            with self.current_playback_lock:
-                if self.current_playback:
-                    try:
-                        sd.stop()
-                        if hasattr(self, 'stream') and self.stream:
-                            self.stream.close()
-                            self.stream = None
-                        self.current_playback = False
-                        self.logger.debug("Stopped current playback")
-                    except Exception as e:
-                        self.logger.error(f"Error stopping playback: {e}")
-
-    def handle_child(self, signum: int, frame: Any) -> None:
-        """Handle child process termination"""
+    def start(self) -> None:
+        """Start the voice server"""
         try:
-            while True:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-                if pid == 0:
-                    break
-                self.logger.debug(f"Child process {pid} terminated with status {status}")
-        except ChildProcessError:
-            pass
-        except Exception as e:
-            self.logger.error(f"Error in handle_child: {e}")
-
-    def send_request(self, sock: socket.socket, request: dict) -> None:
-        """Send a request with proper length prefix"""
-        request_data = json.dumps(request).encode('utf-8')
-        length_prefix = f"{len(request_data):08d}\n".encode('utf-8')
-        sock.sendall(length_prefix + request_data)
-
-    def receive_response(self, sock: socket.socket) -> dict:
-        """Receive a length-prefixed response with proper error handling"""
-        # Read length prefix
-        length_data = sock.recv(9)
-        if not length_data:
-            raise RuntimeError("Connection closed while reading length")
-        
-        try:
-            expected_length = int(length_data.decode().strip())
-            self.logger.debug(f"Expecting response of length {expected_length}")
-        except ValueError:
-            raise ValueError(f"Invalid length prefix: {length_data!r}")
-        
-        # Read response data in chunks
-        response_data = bytearray()
-        remaining = expected_length
-        start_time = time.time()
-        
-        while remaining > 0:
-            if time.time() - start_time > SERVER_TIMEOUT:
-                raise socket.timeout("Timeout while reading response")
-                
-            chunk = sock.recv(min(8192, remaining))
-            if not chunk:
-                raise RuntimeError("Connection closed while reading response")
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind((self.host, self.port))
+            self.socket.listen(5)
             
-            response_data.extend(chunk)
-            remaining -= len(chunk)
-        
-        try:
-            return json.loads(response_data.decode())
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in response: {e}")
+            logger.info(f"Voice server for {self.voice}/{self.lang} listening on {self.host}:{self.port}")
+            
+            # Register with model server
+            if not self.register_with_model_server():
+                raise RuntimeError("Failed to register with model server")
+            
+            # Set up signal handlers
+            signal.signal(signal.SIGTERM, lambda signo, frame: self.handle_shutdown())
+            signal.signal(signal.SIGINT, lambda signo, frame: self.handle_shutdown())
+            
+            while self.running:
+                self.socket.settimeout(1.0)
+                try:
+                    conn, addr = self.socket.accept()
+                    logger.debug(f"Connection from {addr}")
+                    self.handle_client(conn)
+                except socket.timeout:
+                    continue
+                
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+            raise
+        finally:
+            self.cleanup()
+
+    def handle_shutdown(self) -> None:
+        """Handle shutdown signals"""
+        logger.info("Received shutdown signal")
+        self.running = False
 
     def cleanup(self) -> None:
-        """Clean up resources before shutdown"""
-        self.stop_current_playback()
-        super().cleanup()
+        """Clean up resources"""
+        self.stop_current_stream()
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+        logger.info("Server shut down cleanly")
 
-    def handle_signal(self, signum: int, frame: Any) -> None:
-        """Handle termination signals"""
-        self.logger.info(f"Received signal {signum}, shutting down...")
-        self.running = False
-        self.cleanup()
-        sys.exit(0)
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Voice-specific TTS server")
+    parser.add_argument("--voice", required=True, help="Voice name")
+    parser.add_argument("--lang", required=True, help="Language code")
+    parser.add_argument("--port", required=True, type=int, help="Port to listen on")
+    
+    args = parser.parse_args()
+    
+    server = VoiceServer(args.voice, args.lang, args.port)
+    server.start()
