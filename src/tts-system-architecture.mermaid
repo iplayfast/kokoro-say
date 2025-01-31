@@ -1,0 +1,26 @@
+graph TD
+    A[Client - say.py] -->|Socket Request| B[Model Server]
+    A -->|Socket Request| C[Voice Server]
+    
+    subgraph Model Layer
+        B -->|Load Model| D[Kokoro Model]
+        B -->|Cache| E[Voice Cache]
+        B -->|Manage| F[Voice Registry]
+    end
+    
+    subgraph Voice Layer
+        C -->|Audio Output| G[Sound Device]
+        C -->|Request TTS| B
+        C -->|Stream Control| H[Audio Stream]
+    end
+    
+    subgraph Resource Management
+        I[Activity Monitor] -->|Check Timeouts| B
+        I -->|Check Timeouts| C
+        J[Cache Manager] -->|Manage| E
+    end
+    
+    classDef server fill:#f9f,stroke:#333,stroke-width:2px
+    classDef resource fill:#bbf,stroke:#333,stroke-width:2px
+    class B,C server
+    class D,E,F,G,H resource
