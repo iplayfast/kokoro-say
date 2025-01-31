@@ -36,6 +36,8 @@ class ModelServer:
         self.running = True
         self.model = None
         self.pipeline = None
+        self.voice_cache: Dict[str, Any] = {}  # Cache for loaded voice packs
+        self.voice_cache_lock = threading.Lock()  # Thread safety for cache
 
     def initialize_model(self, voice: str = "af_heart"):
         """Initialize Kokoro TTS model"""
@@ -49,10 +51,13 @@ class ModelServer:
             self.model = KModel().to(device).eval()
             
             # Initialize pipeline
-            self.pipeline = KPipeline(lang_code='a', model=False)  # Start with English US
+            self.pipeline = KPipeline(lang_code='a', model=False)
             
             # Add custom pronunciations
             self.pipeline.g2p.lexicon.golds['kokoro'] = 'kˈOkəɹO'
+            
+            # Pre-load default voice
+            self._load_voice(voice)
             
             logger.info("Kokoro model and pipeline initialized successfully")
             
@@ -60,101 +65,17 @@ class ModelServer:
             logger.error(f"Failed to initialize Kokoro model: {e}")
             raise
 
-    def start(self):
-        """Start the model server"""
-        try:
-            # Initialize model
-            self.initialize_model()
-
-            # Set up signal handlers
-            signal.signal(signal.SIGTERM, lambda signo, frame: self.handle_shutdown())
-            signal.signal(signal.SIGINT, lambda signo, frame: self.handle_shutdown())
-
-            # Set up socket
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((MODEL_SERVER_HOST, MODEL_SERVER_PORT))
-            self.socket.listen(5)
-            self.socket.settimeout(1.0)  # Allow interruption for shutdown
+    def _load_voice(self, voice: str) -> Any:
+        """Load a voice pack with caching"""
+        with self.voice_cache_lock:
+            if voice in self.voice_cache:
+                logger.debug(f"Using cached voice pack for {voice}")
+                return self.voice_cache[voice]
             
-            logger.info(f"Model server listening on {MODEL_SERVER_HOST}:{MODEL_SERVER_PORT}")
-
-            while self.running:
-                try:
-                    conn, addr = self.socket.accept()
-                    # Handle client in new thread
-                    threading.Thread(target=self.handle_client, args=(conn,), daemon=True).start()
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.running:
-                        logger.error(f"Accept error: {e}")
-
-        except Exception as e:
-            logger.error(f"Server error: {e}")
-            raise
-        finally:
-            self.cleanup()
-
-    def handle_client(self, conn: socket.socket):
-        """Handle client connection"""
-        try:
-            # Set timeout for client operations
-            conn.settimeout(SERVER_TIMEOUT)
-
-            # Read length prefix
-            length_data = conn.recv(9).decode().strip()
-            if not length_data:
-                raise ConnectionError("Connection closed while reading length prefix")
-
-            expected_length = int(length_data)
-
-            # Read message data
-            data = bytearray()
-            remaining = expected_length
-            while remaining > 0:
-                chunk = conn.recv(min(8192, remaining))
-                if not chunk:
-                    raise ConnectionError(f"Connection closed with {remaining} bytes remaining")
-                data.extend(chunk)
-                remaining -= len(chunk)
-
-            # Send acknowledgment
-            conn.send(b'ACK')
-
-            # Process request
-            request = json.loads(data.decode())
-            response = self.process_request(request)
-
-            # Send response
-            response_data = json.dumps(response).encode()
-            conn.send(f"{len(response_data):08d}\n".encode())
-            conn.send(response_data)
-
-            # Wait for final confirmation
-            try:
-                fin = conn.recv(3)
-                if fin != b'FIN':
-                    logger.warning(f"Client sent invalid final confirmation: {fin!r}")
-            except socket.timeout:
-                logger.warning("Timeout waiting for client's final confirmation")
-
-        except Exception as e:
-            logger.error(f"Error handling client: {e}")
-            try:
-                error_response = {
-                    "status": "error",
-                    "message": str(e)
-                }
-                response_data = json.dumps(error_response).encode()
-                conn.send(f"{len(response_data):08d}\n".encode())
-                conn.send(response_data)
-            except:
-                pass
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
+            logger.debug(f"Loading voice pack for {voice}")
+            pack = self.pipeline.load_voice(voice)
+            self.voice_cache[voice] = pack
+            return pack
 
     def process_request(self, request: dict) -> dict:
         """Process client request"""
@@ -174,18 +95,14 @@ class ModelServer:
                 speed = request.get("speed", 1.0)
                 
                 try:
-                    # Ensure we have the voice
-                    _, voice_path = ensure_model_and_voices(voice)
-                    
-                    # Load voice
-                    pack = self.pipeline.load_voice(voice)
+                    # Get voice pack from cache
+                    pack = self._load_voice(voice)
                     
                     # Generate audio
                     for _, ps, _ in self.pipeline(request["text"], voice, speed):
                         ref_s = pack[len(ps)-1]
                         try:
                             audio = self.model(ps, ref_s, speed)
-                            # Convert to numpy array
                             audio_data = audio.cpu().numpy()
                             
                             return {
@@ -225,6 +142,9 @@ class ModelServer:
     def cleanup(self):
         """Clean up resources"""
         logger.info("Cleaning up resources")
+        # Clear voice cache
+        with self.voice_cache_lock:
+            self.voice_cache.clear()
         try:
             self.socket.close()
         except:
