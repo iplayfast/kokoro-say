@@ -2,81 +2,142 @@
 
 import os
 import sys
-import socket
 import logging
-import time
-import psutil
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, List, Set, Dict, Tuple
 
-from .constants import LANGUAGES
-from .fetchers import ModelFetcher, VoiceFetcher
+import sounddevice as sd
+import numpy as np
+
+from src.constants import (
+    CACHE_DIR, SAMPLE_RATE, 
+    AMERICAN_VOICES, BRITISH_VOICES,
+    VOICE_PREFIX_MEANINGS
+)
 
 logger = logging.getLogger(__name__)
 
-def ensure_model_and_voices(script_dir: str | os.PathLike) -> Tuple[str, str]:
-    """Ensure model and voices exist, downloading if needed"""
-    script_dir = os.path.expanduser(script_dir)
-    model_path = os.path.join(script_dir, "kokoro-v0_19.onnx")
-    voices_path = os.path.join(script_dir, "voices.json")
+class VoiceManager:
+    def __init__(self):
+        self.american_voices: Set[str] = set()
+        self.british_voices: Set[str] = set()
+        self.voices_dir = CACHE_DIR / "voices"
+        self._discover_voices()
     
-    try:
-        model_fetcher = ModelFetcher()
-        voice_fetcher = VoiceFetcher()
+    def _discover_voices(self) -> None:
+        """Discover available voices by checking the cache directory"""
+        # Add all known voices from constants
+        self.american_voices.update(AMERICAN_VOICES.keys())
+        self.british_voices.update(BRITISH_VOICES.keys())
         
-        model_fetcher.fetch_model(model_path)
-        voice_fetcher.fetch_voices(voices_path)
-    except Exception as e:
-        logger.error(f"Setup failed: {e}")
-        raise RuntimeError(f"Failed to ensure model and voices: {e}")
+        if not self.voices_dir.exists():
+            return
+            
+        # Update with any additional voices found in cache
+        for voice_file in self.voices_dir.glob("*.pt"):
+            voice_name = voice_file.stem  # Remove .pt extension
+            if voice_name.startswith(("af_", "am_")):
+                self.american_voices.add(voice_name)
+            elif voice_name.startswith(("bf_", "bm_")):
+                self.british_voices.add(voice_name)
     
-    return model_path, voices_path
+    @property
+    def all_voices(self) -> List[str]:
+        """Get list of all available voices"""
+        return sorted(list(self.american_voices | self.british_voices))
+    
+    def is_british_voice(self, voice: str) -> bool:
+        """Check if a voice is British"""
+        return voice in self.british_voices
 
-def get_voice_from_input(voice_input: str, voices: List[str]) -> Optional[str]:
+    def is_available(self, voice: str) -> bool:
+        """Check if a voice is available"""
+        return voice in (self.american_voices | self.british_voices)
+    
+    def get_voice_info(self, voice: str) -> str:
+        """Get descriptive information for a voice"""
+        if voice in AMERICAN_VOICES:
+            return AMERICAN_VOICES[voice]
+        if voice in BRITISH_VOICES:
+            return BRITISH_VOICES[voice]
+        return voice  # Fallback to voice name if not found in descriptions
+
+    def ensure_voice_available(self, voice: str) -> None:
+        """Ensure a voice is available, downloading if necessary"""
+        from src.fetchers import VoiceFetcher
+        fetcher = VoiceFetcher()
+        fetcher.fetch_voices(voice)
+        self._discover_voices()  # Refresh available voices
+
+def play_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
+    """Play audio using sounddevice"""
+    sd.play(audio, sample_rate)
+    sd.wait()
+
+def get_voice_from_input(voice_input: str, voice_manager: VoiceManager) -> str:
     """Convert voice input (name or number) to voice name"""
+    all_voices = voice_manager.all_voices
+    
     if voice_input.isdigit():
         index = int(voice_input) - 1
-        if 0 <= index < len(voices):
-            return voices[index]
-    elif voice_input in voices:
+        if 0 <= index < len(all_voices):
+            return all_voices[index]
+    elif voice_input in all_voices:
         return voice_input
-    return None
+    raise ValueError(f"Invalid voice: {voice_input}")
 
-def get_language_from_input(lang_input: str) -> Optional[str]:
+def get_language_from_input(lang_input: str, languages: List[tuple[str, str]]) -> str:
     """Convert language input (code or number) to language code"""
     if lang_input.isdigit():
         index = int(lang_input) - 1
-        if 0 <= index < len(LANGUAGES):
-            return LANGUAGES[index][0]
+        if 0 <= index < len(languages):
+            return languages[index][0]
     else:
-        for code, _ in LANGUAGES:
+        for code, _ in languages:
             if code == lang_input:
                 return code
-    return None
+    raise ValueError(f"Invalid language: {lang_input}")
 
-def ensure_model_server_running() -> bool:
-    """Ensure model server is running"""
-    from .model_server import is_server_running, ensure_server_running
-    return ensure_server_running()
-
-def ensure_voice_server_running(voice: str, lang: str) -> bool:
-    """Ensure voice server for given voice/lang is running"""
-    from .voice_server import ensure_server_running
-    return ensure_server_running(voice, lang)
-
-def kill_all_daemons() -> bool:
-    """Kill all TTS-related processes"""
-    killed = False
+def show_help(voice_manager: VoiceManager, languages: List[Tuple[str, str]]) -> None:
+    """Display available voices and languages"""
+    if voice_manager.american_voices:
+        print("\nAmerican English Voices:")
+        for i, voice in enumerate(sorted(voice_manager.american_voices), 1):
+            print(f"  {i:2d}. {voice} - {voice_manager.get_voice_info(voice)}")
     
-    # Find and kill Python processes containing our server names
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            cmdline = proc.cmdline()
-            if any(x in str(cmdline) for x in ['model_server.py', 'voice_server.py']):
-                proc.terminate()
-                killed = True
-                logger.info(f"Terminated process {proc.pid}")
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+    if voice_manager.british_voices:
+        base_index = len(voice_manager.american_voices) + 1
+        print("\nBritish English Voices:")
+        for i, voice in enumerate(sorted(voice_manager.british_voices), base_index):
+            print(f"  {i:2d}. {voice} - {voice_manager.get_voice_info(voice)}")
     
-    return killed
+    if not (voice_manager.american_voices or voice_manager.british_voices):
+        print("\nNo voices found. Run a TTS command first to download voices.")
+    
+    print("\nLanguages:")
+    for i, (code, name) in enumerate(languages, 1):
+        print(f"  {i:2d}. {code:6s} - {name}")
+    
+    print("\nVoice naming convention:")
+    for prefix, meaning in VOICE_PREFIX_MEANINGS.items():
+        print(f"  {prefix}_* - {meaning} voices")
+    
+    print("\nUsage examples:")
+    cmd = os.path.basename(sys.argv[0])
+    if voice_manager.american_voices:
+        example_voice = next(iter(sorted(voice_manager.american_voices)))
+    elif voice_manager.british_voices:
+        example_voice = next(iter(sorted(voice_manager.british_voices)))
+    else:
+        example_voice = "af_heart"
+        
+    print(f"  1. Basic usage:")
+    print(f"     {cmd} --voice {example_voice} \"Hello World\"")
+    print(f"\n  2. Using voice by number:")
+    print(f"     {cmd} --voice 1 \"Hello World\"")
+    print(f"\n  3. Adjusting speech speed:")
+    print(f"     {cmd} --speed 1.2 \"Hello World\"")
+    print(f"\n  4. Using pipe input:")
+    print(f"     echo \"Hello World\" | {cmd}")
+    print(f"\n  5. Saving to WAV file:")
+    print(f"     {cmd} --output speech.wav \"Hello World\"")
