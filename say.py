@@ -169,77 +169,57 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file:
         
         # Connect to model server
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(constants.SERVER_TIMEOUT)
         sock.connect((constants.MODEL_SERVER_HOST, constants.MODEL_SERVER_PORT))
         
-        # Prepare and send message
-        message = json.dumps({
+        # Prepare message
+        message = {
             "text": text,
             "voice": voice,
             "lang": lang,
             "speed": speed,
             "output_file": output_file  # Add output file path if specified
-        }).encode()
+        }
         
         logger.debug(f"Sending message: {message}")
-        sock.sendall(message)
         
-        # Wait for response with timeout
-        sock.settimeout(constants.SERVER_TIMEOUT)
-        
-        # Read response in chunks
-        chunks = []
-        while True:
-            try:
-                chunk = sock.recv(8192)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            except socket.timeout:
-                logger.error("Timeout receiving response from server")
-                break
-                
-        response_data = b''.join(chunks)
-        
-        if not response_data:
-            logger.error("No response received from server")
-            return False
-            
         try:
-            # Parse the response header
-            response_str = response_data.decode('utf-8', errors='ignore')
+            # Use SocketProtocol to send JSON message
+            from src.socket_protocol import SocketProtocol
+            SocketProtocol.send_json(sock, message)
             
+            # Receive response using SocketProtocol
             try:
-                response_json = json.loads(response_str)
+                response = SocketProtocol.receive_json(sock)
                 
-                if response_json.get("status") == "success":
+                if response.get("status") == "success":
                     if output_file:
                         logger.info(f"Successfully synthesized speech and saved to {output_file}")
                     else:
                         logger.info("Successfully synthesized speech")
                     return True
-                elif response_json.get("status") == "error":
-                    logger.error(f"Server error: {response_json.get('error')}")
-                    return False
-                else:
-                    logger.error(f"Unexpected response status: {response_json.get('status')}")
-                    return False
-            except json.JSONDecodeError:
-                # Try checking for success/error in the string
-                if '"status": "success"' in response_str or '"status":"success"' in response_str:
-                    logger.info("Successfully synthesized speech")
-                    return True
-                elif '"status": "error"' in response_str or '"status":"error"' in response_str:
-                    error_msg = "Unknown error"
+                elif response.get("status") == "error":
+                    error_msg = response.get("error", "Unknown server error")
                     logger.error(f"Server error: {error_msg}")
                     return False
                 else:
-                    logger.error(f"Unexpected response format: {response_str[:100]}")
+                    logger.error(f"Unexpected response status: {response.get('status')}")
                     return False
                 
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON response beginning with: {response_data[:100]}")
-            return False
+            except Exception as e:
+                logger.error(f"Error receiving response: {e}")
+                return False
             
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+            return False
+        
+    except socket.timeout:
+        logger.error("Connection to model server timed out")
+        return False
+    except ConnectionRefusedError:
+        logger.error("Connection to model server was refused")
+        return False
     except Exception as e:
         logger.error(f"Failed to send text: {e}")
         return False
@@ -248,7 +228,7 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file:
             sock.close()
         except:
             pass
-                
+                        
 def kill_server():
     """Send exit command to model server."""
     try:

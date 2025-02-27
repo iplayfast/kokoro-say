@@ -37,7 +37,7 @@ class VoiceManager:
             try:
                 with open(self.voices_config_path, 'r') as f:
                     all_voices = json.load(f)
-                logger.debug(f"Found {len(all_voices)} voices in cache")
+                #logger.debug(f"Found {len(all_voices)} voices in cache")
                 
                 # Categorize by prefix
                 for voice in all_voices:
@@ -54,9 +54,9 @@ class VoiceManager:
                 
                 # Return early if we found voices in the cache
                 if self.american_voices or self.british_voices or self.japanese_voices or self.chinese_voices or self.other_voices:
-                    logger.info(f"Loaded {len(self.american_voices)} American, {len(self.british_voices)} British, "
-                               f"{len(self.japanese_voices)} Japanese, {len(self.chinese_voices)} Chinese, "
-                               f"and {len(self.other_voices)} other voices from cached list")
+                    #logger.info(f"Loaded {len(self.american_voices)} American, {len(self.british_voices)} British, "
+                    #           f"{len(self.japanese_voices)} Japanese, {len(self.chinese_voices)} Chinese, "
+                    #           f"and {len(self.other_voices)} other voices from cached list")
                     return
             except Exception as e:
                 logger.error(f"Error reading cached voice list: {e}")

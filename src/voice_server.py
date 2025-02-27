@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-
 import os
 import sys
 import json
 import socket
 import logging
-import signal
 import threading
 import time
 from pathlib import Path
@@ -13,7 +11,6 @@ from typing import Optional, Dict, List
 import numpy as np
 import sounddevice as sd
 from datetime import datetime, timedelta
-
 from src.constants import (
     SOCKET_BASE_PATH,
     MODEL_SERVER_HOST,
@@ -22,9 +19,7 @@ from src.constants import (
     SAMPLE_RATE,
     LOG_FILE
 )
-
 from src.socket_protocol import SocketProtocol
-
 logger = logging.getLogger(__name__)
 
 class AudioManager:
@@ -92,7 +87,7 @@ class AudioManager:
         except Exception as e:
             logger.error(f"Error during audio playback: {e}")
             self.playing = False
-    
+
 class VoiceServer:
     """Server handling voice-specific TTS pipeline and playback."""
     
@@ -107,6 +102,14 @@ class VoiceServer:
         self.pipeline = None
         self.monitor_thread = None
         self.socket_path = f"{SOCKET_BASE_PATH}_{voice}_{lang}"
+        
+        # For handling ongoing synthesis
+        self.current_synthesis_id = None
+        self.synthesis_lock = threading.Lock()
+        
+        # Accumulated audio for saving to file if needed
+        self.current_audio_buffer = []
+        self.current_audio_lock = threading.Lock()
         
         # Set up logging for this specific voice server
         file_handler = logging.FileHandler(f"/tmp/voice_server_{voice}_{lang}.log")
@@ -190,9 +193,9 @@ class VoiceServer:
             # Update activity timestamp
             self.last_activity = datetime.now()
             
-            # Receive message using SocketProtocol
+            # Receive message using enhanced SocketProtocol
             try:
-                data = SocketProtocol.receive_message(conn)
+                command, data = SocketProtocol.receive_message(conn)
                 request = json.loads(data.decode('utf-8'))
                 logger.debug(f"Received request: {request}")
             except Exception as e:
@@ -205,7 +208,7 @@ class VoiceServer:
                 self.running = False
                 response = {"status": "shutting_down"}
                 try:
-                    SocketProtocol.send_message(conn, response)
+                    SocketProtocol.send_json(conn, response)
                 except:
                     pass
                 return
@@ -224,9 +227,27 @@ class VoiceServer:
                 
     def process_synthesis(self, request: Dict, conn: socket.socket):
         """Process synthesis request through model server and play audio."""
+        # Generate a unique ID for this synthesis request
+        synthesis_id = f"{int(time.time())}-{os.getpid()}"
+        
+        with self.synthesis_lock:
+            # Stop any current synthesis and playback
+            if self.current_synthesis_id:
+                logger.info(f"Interrupting previous synthesis {self.current_synthesis_id}")
+                
+            # Set as current synthesis
+            self.current_synthesis_id = synthesis_id
+            
+            # Stop any current audio playback
+            self.audio_manager.stop_current()
+            
+            # Clear audio buffer for new synthesis
+            with self.current_audio_lock:
+                self.current_audio_buffer.clear()
+        
         try:
             thread_id = threading.get_ident()
-            logger.info(f"Processing synthesis in thread {thread_id}")
+            logger.info(f"Processing synthesis {synthesis_id} in thread {thread_id}")
             start_time = time.time()
             
             # Get synthesis parameters
@@ -236,134 +257,135 @@ class VoiceServer:
             
             logger.info(f"Processing synthesis request: '{text[:30]}...' for voice {self.voice}")
             
-            # Always stop any current playback when a new request is received
-            # This ensures proper interruption behavior
-            logger.info(f"Stopping any current audio for {self.voice}")
-            self.audio_manager.stop_current()
-            
-            # Send request to model server
+            # Send streaming request to model server
             model_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             conn_start = time.time()
             model_sock.connect((MODEL_SERVER_HOST, MODEL_SERVER_PORT))
             logger.info(f"Connected to model server in {time.time() - conn_start:.4f} seconds")
             
-            # Prepare model server request
+            # Prepare model server request with streaming flag
             model_request = {
                 "text": text,
                 "voice": self.voice,
                 "speed": speed,
-                "lang": self.lang
+                "lang": self.lang,
+                "streaming": True,
+                "from_voice_server": True
             }
             
-            # Send request with special flag indicating it's from voice server
-            model_request["from_voice_server"] = True
-            logger.info(f"Sending request to model server: {len(json.dumps(model_request))} bytes")
-            req_send_time = time.time()
-            model_sock.sendall(json.dumps(model_request).encode())
-            logger.info(f"Request sent in {time.time() - req_send_time:.4f} seconds")
+            # Send request to model server
+            SocketProtocol.send_json(model_sock, model_request)
+            logger.info(f"Request sent to model server in {time.time() - conn_start:.4f} seconds")
             
-            # Receive response with better error handling
+            # Send immediate success response to client
             try:
-                model_sock.settimeout(300.0)  # Longer timeout for synthesis (5 minutes)
-                response_data = b""
-                chunk_size = 8192
-                
-                recv_start = time.time()
-                logger.info(f"Waiting for model server response")
-                
-                # Read in chunks until we get all data
-                chunks_received = 0
-                while True:
-                    chunk = model_sock.recv(chunk_size)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                    chunks_received += 1
-                    
-                    # Every 10 chunks, log progress
-                    if chunks_received % 10 == 0:
-                        logger.debug(f"Received {len(response_data)/1024:.2f} KB in {chunks_received} chunks")
-                    
-                    # Try parsing after each chunk to see if we have complete data
-                    try:
-                        json.loads(response_data.decode())
-                        break  # Successfully parsed, we have complete data
-                    except json.JSONDecodeError:
-                        # Not complete yet, continue reading
-                        pass
-                
-                logger.info(f"Response received in {time.time() - recv_start:.2f} seconds, size: {len(response_data)/1024:.2f} KB")
-                model_sock.close()
-                
-                if not response_data:
-                    raise RuntimeError("No response from model server")
-            except socket.timeout:
-                model_sock.close()
-                raise RuntimeError("Timeout waiting for model server response")
-                
-            # Parse response
-            parse_start = time.time()
-            response = json.loads(response_data.decode())
-            logger.info(f"Response parsed in {time.time() - parse_start:.4f} seconds")
+                SocketProtocol.send_json(conn, {"status": "success"})
+            except:
+                # Client might have disconnected, which is expected
+                pass
             
-            if response.get("status") == "error":
-                error_msg = response.get("error", "Unknown error")
-                logger.error(f"Model server error: {error_msg}")
-                SocketProtocol.send_message(conn, {"status": "error", "error": error_msg})
-                return
+            # Process streaming response from model server
+            model_sock.settimeout(300.0)  # 5 minute timeout for long texts
+            
+            # First message should be header with stream info
+            command, data = SocketProtocol.receive_message(model_sock)
+            if command != SocketProtocol.CMD_JSON:
+                raise RuntimeError(f"Expected JSON stream header, got {command}")
                 
-            # Convert audio data to numpy array
-            convert_start = time.time()
-            audio_data = np.array(response["audio"], dtype=np.float32)
-            sample_rate = response.get("sample_rate", SAMPLE_RATE)
-            logger.info(f"Audio data converted in {time.time() - convert_start:.4f} seconds")
+            stream_info = json.loads(data.decode())
+            logger.info(f"Received stream info: {stream_info}")
             
-            logger.info(f"Received audio: {len(audio_data)} samples, min={audio_data.min():.4f}, max={audio_data.max():.4f}")
+            if stream_info.get("status") == "error":
+                raise RuntimeError(f"Model server error: {stream_info.get('error')}")
+                
+            # Flag indicating if we're saving to file
+            is_saving = output_file is not None
             
-            # Handle output file if specified
-            if output_file:
+            # Process audio chunks as they arrive
+            is_synthesis_complete = False
+            full_audio_data = []
+            
+            while not is_synthesis_complete:
                 try:
-                    import soundfile as sf
-                    sf.write(output_file, audio_data, sample_rate)
-                    logger.info(f"Saved audio to file: {output_file}")
+                    # Check if we've been interrupted
+                    with self.synthesis_lock:
+                        if self.current_synthesis_id != synthesis_id:
+                            logger.info(f"Synthesis {synthesis_id} was interrupted, stopping")
+                            break
                     
-                    # Send success response to client
-                    SocketProtocol.send_message(conn, {
-                        "status": "success",
-                        "message": f"Audio saved to {output_file}"
-                    })
+                    # Receive next message
+                    command, data = SocketProtocol.receive_message(model_sock)
+                    
+                    if command == SocketProtocol.CMD_JSON:
+                        # JSON message - could be status update or error
+                        message = json.loads(data.decode())
+                        logger.info(f"Received JSON message: {message}")
+                        
+                        if message.get("status") == "error":
+                            logger.error(f"Error from model server: {message.get('error')}")
+                            break
+                            
+                        if message.get("status") == "chunk_error":
+                            logger.warning(f"Chunk error: {message.get('error')}")
+                            # Continue processing other chunks
+                            continue
+                            
+                    elif command == SocketProtocol.CMD_AUDIO:
+                        # Audio chunk
+                        audio_data = np.frombuffer(data, dtype=np.float32)
+                        full_audio_data.append(audio_data)
+                        
+                        # Store for saving if needed
+                        if is_saving:
+                            with self.current_audio_lock:
+                                self.current_audio_buffer.append(audio_data)
+                                
+                    elif command == SocketProtocol.CMD_END:
+                        # Final audio chunk
+                        audio_data = np.frombuffer(data, dtype=np.float32)
+                        full_audio_data.append(audio_data)
+                        
+                        # Store for saving
+                        if is_saving:
+                            with self.current_audio_lock:
+                                self.current_audio_buffer.append(audio_data)
+                        
+                        # Mark synthesis as complete
+                        is_synthesis_complete = True
+                        logger.info(f"Synthesis {synthesis_id} complete")
+                        
+                    else:
+                        logger.warning(f"Unknown command from model server: {command}")
+                        
                 except Exception as e:
-                    logger.error(f"Failed to save audio file: {e}")
-                    SocketProtocol.send_message(conn, {
-                        "status": "error", 
-                        "error": f"Failed to save audio file: {str(e)}"
-                    })
-            else:
-                # Play audio and log the exact moment playback begins
-                logger.info(f"Starting audio playback for voice {self.voice}: {text[:30]}...")
-                playback_start = time.time()
+                    logger.error(f"Error processing streaming response: {e}")
+                    break
+            
+            # Close model server connection
+            model_sock.close()
+            
+            # If we collected audio, play or save it
+            if full_audio_data:
+                # Concatenate audio chunks
+                final_audio = np.concatenate(full_audio_data)
                 
-                # Play the audio using our improved audio manager
-                self.audio_manager.play(audio_data, sample_rate)
-                
-                logger.info(f"Playback initiated for voice {self.voice} in {time.time() - playback_start:.4f} seconds")
-                
-                # Send success response to client (client has already exited by now)
-                try:
-                    SocketProtocol.send_message(conn, {"status": "success"})
-                except:
-                    # Client likely already disconnected, which is expected
-                    logger.debug("Client already disconnected when sending playback success")
+                # If output file is specified, save to file
+                if is_saving:
+                    try:
+                        import soundfile as sf
+                        sf.write(output_file, final_audio, SAMPLE_RATE)
+                        logger.info(f"Saved audio to file: {output_file}")
+                    except Exception as e:
+                        logger.error(f"Failed to save audio file: {e}")
+                else:
+                    # Play audio using the simpler playback method
+                    self.audio_manager.play(final_audio, SAMPLE_RATE)
             
             total_time = time.time() - start_time
             logger.info(f"Total synthesis processing completed in {total_time:.2f} seconds")
             
         except Exception as e:
             logger.error(f"Error processing synthesis: {e}")
-            try:
-                SocketProtocol.send_message(conn, {"status": "error", "error": str(e)})
-            except:
-                pass
         finally:
             try:
                 # Close model server socket if still open
@@ -372,10 +394,12 @@ class VoiceServer:
             except:
                 pass
     
+      
     def _monitor_activity(self):
         """Monitor for inactivity and shut down if inactive too long."""
         while self.running:
             try:
+                # Check if we're still playing audio
                 if datetime.now() - self.last_activity > timedelta(seconds=VOICE_SERVER_INACTIVE_TIMEOUT):
                     logger.info(f"Voice server {self.voice}/{self.lang} inactive for {VOICE_SERVER_INACTIVE_TIMEOUT} seconds, shutting down")
                     self.running = False
@@ -388,6 +412,7 @@ class VoiceServer:
         """Stop the voice server gracefully."""
         logger.info("Stopping voice server")
         self.running = False
+        self.audio_manager.stop_current()
         
     def cleanup(self):
         """Clean up resources."""
@@ -409,3 +434,6 @@ class VoiceServer:
         
         # Clear pipeline
         self.pipeline = None
+        
+        logger.info(f"Voice server for {self.voice}/{self.lang} shut down")
+

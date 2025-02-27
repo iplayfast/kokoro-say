@@ -9,8 +9,9 @@ import signal
 import threading
 import queue
 import time
+import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
@@ -28,11 +29,7 @@ from src.socket_protocol import SocketProtocol
 logger = logging.getLogger(__name__)
 
 class ModelServer:
-    """Central server that maintains single KModel instance and handles synthesis requests.
-    
-    This server acts as a coordinator for voice-specific servers, routing requests to the
-    appropriate voice server and managing the shared model resources.
-    """
+    """Central server that maintains single KModel instance and handles synthesis requests."""
     
     def __init__(self):
         self.running = True
@@ -40,13 +37,14 @@ class ModelServer:
         self.pipeline = None
         self.model_lock = threading.Lock()
         self.request_queue = queue.Queue()
-        self.synthesis_thread = None
+        self.worker_threads = []
+        self.num_workers = 4  # Number of worker threads
         
         # Dictionary to track running voice servers
         self.voice_servers = {}
         self.voice_servers_lock = threading.Lock()
         
-        # Thread pool for handling synthesis requests
+        # Thread pool for handling client requests
         self.thread_pool = ThreadPoolExecutor(max_workers=8)
         
         # TCP socket for voice server communication
@@ -93,7 +91,7 @@ class ModelServer:
         """Initialize the central KModel instance."""
         from kokoro import KPipeline
         import torch
-        from src.fetchers import ensure_model_and_voices  # Explicit import
+        from src.fetchers import ensure_model_and_voices
 
         try:
             # Ensure model and voices exist (using default voice)
@@ -256,22 +254,18 @@ except Exception as e:
             voice_sock.connect(socket_path)
             
             # Forward the request
-            request_data = json.dumps(request).encode()
-            SocketProtocol.send_message(voice_sock, request_data)
+            SocketProtocol.send_json(voice_sock, request)
             
             # Return immediate acknowledgment to client
             # This lets the client exit right away
             success_response = {"status": "success", "message": "Request received, processing..."}
-            client_conn.sendall(json.dumps(success_response).encode())
+            SocketProtocol.send_json(client_conn, success_response)
             
-            # No need to wait for voice server response, as client has already gotten acknowledgment
-            # The voice server will handle playback independently
-        
         except Exception as e:
             logger.error(f"Error forwarding to voice server: {e}")
             try:
                 error_response = {"status": "error", "error": str(e)}
-                client_conn.sendall(json.dumps(error_response).encode())
+                SocketProtocol.send_json(client_conn, error_response)
             except:
                 pass
         
@@ -301,7 +295,7 @@ except Exception as e:
                         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                         sock.connect(socket_path)
                         request = {"command": "exit"}
-                        sock.sendall(json.dumps(request).encode())
+                        SocketProtocol.send_json(sock, request)
                         sock.close()
                 except:
                     pass
@@ -319,7 +313,16 @@ except Exception as e:
                     
             # Clear the dictionary
             self.voice_servers.clear()
-                
+    
+    def start_worker_threads(self):
+        """Start worker threads for synthesis processing."""
+        for _ in range(self.num_workers):
+            worker = threading.Thread(target=self.synthesis_worker)
+            worker.daemon = True
+            worker.start()
+            self.worker_threads.append(worker)
+        logger.info(f"Started {self.num_workers} worker threads")
+            
     def start(self):
         """Start the model server."""
         try:
@@ -330,13 +333,10 @@ except Exception as e:
                 if self.model is None:
                     raise RuntimeError("Model initialization failed")
             
-            # Start synthesis worker thread if not running
-            if self.synthesis_thread is None:
-                self.synthesis_thread = threading.Thread(target=self.synthesis_worker)
-                self.synthesis_thread.daemon = True
-                self.synthesis_thread.start()
+            # Start worker threads
+            self.start_worker_threads()
             
-            # Bind TCP socket if not already bound
+            # Bind TCP socket
             try:
                 self.tcp_sock.bind((MODEL_SERVER_HOST, MODEL_SERVER_PORT))
                 self.tcp_sock.listen(5)
@@ -366,31 +366,17 @@ except Exception as e:
         finally:
             if not self.running:
                 self.cleanup()
-
     def handle_client(self, conn: socket.socket):
         """Handle client connection and process requests by routing to voice servers."""
         try:
-            # Receive data using standard protocol
-            raw_data = conn.recv(8192)
-            logger.debug(f"Received {len(raw_data)} bytes")
-            
+            # Receive data using socket protocol
             try:
-                # Decode the bytes to string
-                data = raw_data.decode('utf-8')
-                logger.debug(f"Decoded data: {data}")
-            except UnicodeDecodeError as e:
-                logger.error(f"Decoding error: {e}")
+                request = SocketProtocol.receive_json(conn)
+                logger.debug(f"Received request: {request}")
+            except Exception as e:
+                logger.error(f"Error receiving message: {e}")
                 return
             
-            try:
-                # Try to parse as JSON directly
-                request = json.loads(data)
-                logger.debug(f"Parsed request: {request}")
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing error: {e}")
-                logger.error(f"Problematic data: {data}")
-                return
-                    
             # Process request
             if "command" in request and request["command"] == "exit":
                 logger.info("Received exit command")
@@ -400,7 +386,7 @@ except Exception as e:
                 self.kill_all_voice_servers()
                 
                 response = {"status": "shutdown_initiated"}
-                conn.sendall(json.dumps(response).encode())
+                SocketProtocol.send_json(conn, response)
                 return
                 
             # Handle synthesis request
@@ -412,8 +398,8 @@ except Exception as e:
                 # Check if this is a direct request from a voice server
                 if request.get("from_voice_server", False):
                     logger.info(f"Received direct synthesis request from voice server for {voice}")
-                    # Handle synthesis directly as it's from voice server
-                    self.handle_synthesis_request(request, conn)
+                    # Queue the request for processing by a worker thread
+                    self.request_queue.put((request, conn))
                 else:
                     # This is from the client - route to voice server
                     logger.info(f"Routing client request for voice {voice} and language {lang}")
@@ -423,7 +409,7 @@ except Exception as e:
             logger.error(f"Error handling client request: {e}")
             try:
                 error_response = {"status": "error", "error": str(e)}
-                conn.sendall(json.dumps(error_response).encode())
+                SocketProtocol.send_json(conn, error_response)
             except:
                 pass
             finally:
@@ -432,94 +418,51 @@ except Exception as e:
                 except:
                     pass
     
-    def handle_synthesis_request(self, request, conn):
-        """Handle synthesis request directly"""
-        try:
-            start_time = time.time()
-            logger.info(f"Starting synthesis at {start_time}")
+    def _split_text(self, text):
+        """Split text into reasonable chunks for processing."""
+        if not text:
+            return []
             
-            # Get synthesis parameters
-            voice = request.get("voice", "af_bella")
-            speed = request.get("speed", 1.0)
-            text = request.get("text", "")
-            
-            logger.info(f"Model server processing text with voice {voice} at speed {speed}")
-            
-            # Use pipeline to generate audio
-            audio_chunks = []
-            
-            # Process text through pipeline
-            try:
-                # Process through pipeline
-                synthesis_start = time.time()
-                for graphemes, phonemes, audio in self.pipeline(
-                    text=text,
-                    voice=voice,
-                    speed=speed
-                ):
-                    logger.debug(f"Generated audio chunk: {len(audio)} samples")
-                    audio_chunks.append(audio)
+        # Try to split on sentence boundaries
+        # Split on sentence endings followed by spaces or newlines
+        chunks = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Filter out empty chunks
+        chunks = [c for c in chunks if c.strip()]
+        
+        # If we have very large sentences, split them further
+        MAX_CHUNK_LENGTH = 500  # Characters
+        result = []
+        
+        for chunk in chunks:
+            if len(chunk) <= MAX_CHUNK_LENGTH:
+                result.append(chunk)
+            else:
+                # Split long chunk further at commas, semicolons, etc.
+                subchunks = re.split(r'(?<=[,;:])\s+', chunk)
                 
-                synthesis_time = time.time() - synthesis_start
-                logger.info(f"Pipeline processing completed in {synthesis_time:.2f} seconds")
-                    
-                if not audio_chunks:
-                    raise ValueError("No audio chunks generated")
-                    
-                # Concatenate all chunks
-                concat_start = time.time()
-                final_audio = np.concatenate(audio_chunks)
-                logger.info(f"Audio concatenation completed in {time.time() - concat_start:.2f} seconds")
-                
-                # Send audio data back in correct format for voice server
-                logger.info(f"Sending audio data: {len(final_audio)} samples ({len(final_audio)*4/1024:.2f} KB)")
-                
-                # Voice server expects an "audio" key with the audio data
-                response = {
-                    "status": "success", 
-                    "audio": final_audio.tolist(),
-                    "sample_rate": SAMPLE_RATE
-                }
-                
-                # Measure serialization time
-                serialize_start = time.time()
-                response_json = json.dumps(response)
-                logger.info(f"JSON serialization completed in {time.time() - serialize_start:.2f} seconds, size: {len(response_json)/1024:.2f} KB")
-                
-                # Measure sending time
-                send_start = time.time()
-                conn.sendall(response_json.encode())
-                logger.info(f"Audio data sent in {time.time() - send_start:.2f} seconds")
-                
-                total_time = time.time() - start_time
-                logger.info(f"Total synthesis request handling completed in {total_time:.2f} seconds")
-                    
-            except Exception as e:
-                logger.error(f"Pipeline execution error: {e}")
-                error_response = {
-                    "status": "error",
-                    "error": f"Pipeline execution error: {str(e)}"
-                }
-                conn.sendall(json.dumps(error_response).encode())
-                
-        except Exception as e:
-            logger.error(f"Synthesis error: {e}")
-            error_response = {
-                "status": "error",
-                "error": str(e)
-            }
-            try:
-                conn.sendall(json.dumps(error_response).encode())
-            except:
-                pass
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
-               
+                # If still too large, just use fixed-size chunks
+                if any(len(sc) > MAX_CHUNK_LENGTH for sc in subchunks):
+                    current = ""
+                    for sc in subchunks:
+                        if len(current) + len(sc) <= MAX_CHUNK_LENGTH:
+                            current += sc + " "
+                        else:
+                            if current:
+                                result.append(current.strip())
+                            current = sc + " "
+                    if current:
+                        result.append(current.strip())
+                else:
+                    result.extend(subchunks)
+        
+        return result
+    
     def synthesis_worker(self):
         """Worker thread that processes synthesis requests from voice servers."""
+        thread_id = threading.get_ident()
+        logger.info(f"Synthesis worker {thread_id} started")
+        
         while self.running:
             try:
                 # Get next request from queue with timeout
@@ -535,56 +478,61 @@ except Exception as e:
                     speed = request.get("speed", 1.0)
                     text = request.get("text", "")
                     
-                    # We only need model lock for model access, not for the entire synthesis
-                    with self.model_lock:
-                        if self.pipeline is None:
-                            error_response = {
-                                "status": "error",
-                                "error": "Pipeline not initialized"
+                    logger.info(f"Worker {thread_id} processing text with voice {voice} at speed {speed}")
+                    
+                    # Chunk text for more efficient processing
+                    text_chunks = self._split_text(text)
+                    
+                    # Send streaming response start
+                    header = {
+                        "status": "streaming",
+                        "sample_rate": SAMPLE_RATE,
+                        "chunk_count": len(text_chunks)
+                    }
+                    SocketProtocol.send_json(conn, header)
+                    
+                    # Process each text chunk
+                    chunk_index = 0
+                    for text_chunk in text_chunks:
+                        start_time = time.time()
+                        logger.info(f"Processing chunk {chunk_index+1}/{len(text_chunks)}: {text_chunk[:30]}...")
+                        
+                        try:
+                            # Process chunk through pipeline
+                            audio_segments = []
+                            
+                            for graphemes, phonemes, audio in self.pipeline(
+                                text=text_chunk,
+                                voice=voice,
+                                speed=speed
+                            ):
+                                audio_segments.append(audio)
+                            
+                            # Concatenate audio segments for this chunk
+                            if audio_segments:
+                                chunk_audio = np.concatenate(audio_segments)
+                                
+                                # Stream the audio chunk
+                                logger.info(f"Streaming audio chunk {chunk_index+1}: {len(chunk_audio)} samples")
+                                is_final = (chunk_index == len(text_chunks) - 1)
+                                SocketProtocol.send_audio_chunk(conn, chunk_audio, is_final)
+                                
+                            chunk_index += 1
+                            logger.info(f"Chunk {chunk_index}/{len(text_chunks)} completed in {time.time() - start_time:.2f} seconds")
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing chunk {chunk_index}: {e}")
+                            # Send error message but continue with next chunks
+                            error_msg = {
+                                "status": "chunk_error",
+                                "chunk_index": chunk_index,
+                                "error": str(e)
                             }
-                            conn.sendall(json.dumps(error_response).encode())
-                            continue                    
-                    logger.info(f"Model server processing text with voice {voice} at speed {speed}")
+                            SocketProtocol.send_json(conn, error_msg)
+                            chunk_index += 1
                     
-                    # Use pipeline to generate audio
-                    audio_chunks = []
+                    logger.info(f"Completed processing all {len(text_chunks)} chunks for request")
                     
-                    # Process text through pipeline
-                    try:
-                        # NOTE: We don't need the model lock for this part - the pipeline
-                        # and model are thread-safe for inference
-                        for graphemes, phonemes, audio in self.pipeline(
-                            text=text,
-                            voice=voice,
-                            speed=speed
-                        ):
-                            logger.debug(f"Generated audio chunk: {len(audio)} samples")
-                            audio_chunks.append(audio)
-                            
-                        if not audio_chunks:
-                            raise ValueError("No audio chunks generated")
-                            
-                        # Concatenate all chunks
-                        final_audio = np.concatenate(audio_chunks)
-                        logger.info(f"final audio synthesis complete")
-                        # Send audio data back to voice server
-                        response = {
-                            "status": "success",
-                            "audio": final_audio.tolist(),
-                            "sample_rate": SAMPLE_RATE
-                        }
-                        
-                        logger.info(f"Sending audio data: {len(final_audio)} samples")
-                        conn.sendall(json.dumps(response).encode())
-                        logger.info("audio sent")
-                    except Exception as e:
-                        logger.error(f"Pipeline execution error: {e}")
-                        error_response = {
-                            "status": "error",
-                            "error": f"Pipeline execution error: {str(e)}"
-                        }
-                        conn.sendall(json.dumps(error_response).encode())
-                        
                 except Exception as e:
                     logger.error(f"Synthesis error: {e}")
                     error_response = {
@@ -592,22 +540,15 @@ except Exception as e:
                         "error": str(e)
                     }
                     try:
-                        conn.sendall(json.dumps(error_response).encode())
+                        SocketProtocol.send_json(conn, error_response)
                     except:
                         pass
-                    
+                
                 finally:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                        
+                    self.request_queue.task_done()
+                    
             except Exception as e:
                 logger.error(f"Worker error: {e}")
-                try:
-                    conn.close()
-                except:
-                    pass
                                 
     def handle_shutdown(self, signo, frame):
         """Handle shutdown signal."""
@@ -622,10 +563,10 @@ except Exception as e:
         # Kill all voice servers
         self.kill_all_voice_servers()
         
-        # Stop synthesis thread
-        if self.synthesis_thread and self.synthesis_thread.is_alive():
-            self.synthesis_thread.join(timeout=5)
-            
+        # Stop worker threads
+        logger.info("Waiting for worker threads to finish...")
+        self.request_queue.join()  # Wait for all tasks to complete
+        
         # Clean up thread pool
         self.thread_pool.shutdown(wait=True)
         
@@ -638,3 +579,5 @@ except Exception as e:
         # Clear model
         self.model = None
         self.pipeline = None
+        
+        logger.info("Model server shutdown complete")
