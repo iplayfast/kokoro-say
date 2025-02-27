@@ -160,7 +160,7 @@ except Exception as e:
         logger.error(f"Failed to ensure model server: {e}")
         return False
     
-def send_text(text: str, voice: str, lang: str, speed: float = 1.0) -> bool:
+def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file: str = None) -> bool:
     """Send text to model server for synthesis."""
     try:
         # Ensure we have the voice downloaded before sending the request
@@ -176,7 +176,8 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0) -> bool:
             "text": text,
             "voice": voice,
             "lang": lang,
-            "speed": speed
+            "speed": speed,
+            "output_file": output_file  # Add output file path if specified
         }).encode()
         
         logger.debug(f"Sending message: {message}")
@@ -204,25 +205,36 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0) -> bool:
             return False
             
         try:
-            # Only try to parse the start of the response to verify status
-            # We don't need to parse the entire audio data
+            # Parse the response header
             response_str = response_data.decode('utf-8', errors='ignore')
-            status_part = response_str[:50]  # Just get the beginning with status
             
-            if '"status": "success"' in status_part:
-                logger.info("Successfully synthesized speech")
-                return True
-            elif '"status": "error"' in status_part:
-                error_end = response_str.find('}')
-                if error_end > 0:
-                    error_json = json.loads(response_str[:error_end+1])
-                    logger.error(f"Server error: {error_json.get('error')}")
+            try:
+                response_json = json.loads(response_str)
+                
+                if response_json.get("status") == "success":
+                    if output_file:
+                        logger.info(f"Successfully synthesized speech and saved to {output_file}")
+                    else:
+                        logger.info("Successfully synthesized speech")
+                    return True
+                elif response_json.get("status") == "error":
+                    logger.error(f"Server error: {response_json.get('error')}")
+                    return False
                 else:
-                    logger.error("Unknown server error")
-                return False
-            else:
-                logger.error(f"Unexpected response format: {status_part}")
-                return False
+                    logger.error(f"Unexpected response status: {response_json.get('status')}")
+                    return False
+            except json.JSONDecodeError:
+                # Try checking for success/error in the string
+                if '"status": "success"' in response_str or '"status":"success"' in response_str:
+                    logger.info("Successfully synthesized speech")
+                    return True
+                elif '"status": "error"' in response_str or '"status":"error"' in response_str:
+                    error_msg = "Unknown error"
+                    logger.error(f"Server error: {error_msg}")
+                    return False
+                else:
+                    logger.error(f"Unexpected response format: {response_str[:100]}")
+                    return False
                 
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON response beginning with: {response_data[:100]}")
@@ -272,6 +284,7 @@ def main():
     parser.add_argument('--list', action='store_true', help='List available voices and languages')
     parser.add_argument('--update-voices', action='store_true', help='Force update of available voices list')
     parser.add_argument('--no-exit', action='store_true', help='Don\'t exit after sending request (for debugging)')
+    parser.add_argument('--output', help='Save audio to specified WAV file path')
     parser.add_argument('text', nargs='*', help='Text to speak')
     
     args = parser.parse_args()
@@ -297,6 +310,8 @@ def main():
         # Handle kill command
         if args.kill:
             kill_server()
+            # Wait briefly to allow server to fully shut down
+            time.sleep(0.5)
             return
 
         # Get input text
@@ -319,13 +334,36 @@ def main():
             parser.print_help()            
             sys.exit(1)
             
+        # Check if we need to wait for server shutdown before starting
+        # This helps with the timing issue when running after a kill command
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(constants.SERVER_TIMEOUT)
+        result = sock.connect_ex((constants.MODEL_SERVER_HOST, constants.MODEL_SERVER_PORT))
+        sock.close()
+        
+        # If socket is still open, wait for it to close
+        if result == 0:
+            logger.info("Waiting for previous server to shutdown...")
+            # Wait for up to 2 seconds for server to shut down
+            for _ in range(4):
+                time.sleep(0.5)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(constants.SERVER_TIMEOUT)
+                result = sock.connect_ex((constants.MODEL_SERVER_HOST, constants.MODEL_SERVER_PORT))
+                sock.close()
+                if result != 0:
+                    break
+        
         # Ensure model server is running
         if not ensure_model_server():
             logger.error("Failed to start model server")            
             sys.exit(1)
+            
+        # Wait briefly to ensure server is fully initialized 
+        time.sleep(0.5)
         
         # Send text for synthesis
-        if not send_text(text, voice, lang, args.speed):
+        if not send_text(text, voice, lang, args.speed, args.output):
             logger.error("Failed to send text for synthesis")
             sys.exit(1)
             
@@ -339,9 +377,11 @@ def main():
                 sys.stdin.read(1)
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        elif args.output:
+            print(f"Audio saved to {args.output}")
         else:
             # Wait briefly for audio to start playing before exiting
-            print("Request sent successfully. Audio should be playing...")
+            print("Request sent successfully. Audio synthesis in progress...")            
             time.sleep(2)
             
     except KeyboardInterrupt:
