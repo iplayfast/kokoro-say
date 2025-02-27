@@ -90,6 +90,46 @@ class VoiceManager:
         logger.info(f"Found {len(self.american_voices)} American, {len(self.british_voices)} British, "
                   f"{len(self.japanese_voices)} Japanese, {len(self.chinese_voices)} Chinese, "
                   f"and {len(self.other_voices)} other voices from voice files")
+
+    def get_voice_info(self, voice: str) -> dict:
+        """Get information about a specific voice."""
+        # Determine voice characteristics from the name prefix
+        prefix = voice[:2]  # e.g., 'af', 'am', 'bf', 'bm'
+        
+        # Determine gender
+        is_male = prefix[1] == 'm'
+        gender = "male" if is_male else "female"
+        
+        # Determine language and accent
+        if prefix[0] == 'a':
+            language = "en-us"
+            accent = "American"
+        elif prefix[0] == 'b':
+            language = "en-gb"
+            accent = "British"
+        elif prefix[0] == 'j':
+            language = "ja"
+            accent = "Japanese"
+        elif prefix[0] == 'z':
+            language = "cmn"
+            accent = "Chinese"
+        else:
+            language = "en-us"
+            accent = "Unknown"
+        
+        # Determine if the voice is downloaded
+        is_downloaded = self.is_downloaded(voice)
+        
+        # Create voice info dictionary
+        info = {
+            "name": voice,
+            "gender": gender,
+            "language": language,
+            "accent": accent,
+            "downloaded": is_downloaded
+        }
+        
+        return info
     
     @property
     def all_voices(self) -> List[str]:
