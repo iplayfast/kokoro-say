@@ -5,183 +5,295 @@ import sys
 import json
 import socket
 import logging
-import time
 import signal
 import threading
 import queue
 from pathlib import Path
-from typing import Dict, Set, Optional, Any, Union
-import psutil
-import torch
-from kokoro import KModel, KPipeline
+from typing import Dict, Optional
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 from src.constants import (
+    MODEL_PATH,
     MODEL_SERVER_HOST,
     MODEL_SERVER_PORT,
-    SOCKET_BASE_PATH,
-    SERVER_TIMEOUT,
-    MAX_RETRIES
+    VOICES_CONFIG_PATH
 )
-from src.fetchers import ensure_model_and_voices
+
+from src.socket_protocol import SocketProtocol
 
 logger = logging.getLogger(__name__)
 
-
 class ModelServer:
-    """Main model server that handles client connections and manages voice servers"""
-    def __init__(self, script_dir: Path):
-        self.script_dir = script_dir
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.voice_servers: Dict[str, dict] = {}  # {voice_id: {process, last_used}}
+    """Central server that maintains single KModel instance and handles synthesis requests."""
+    
+    def __init__(self):
         self.running = True
         self.model = None
         self.pipeline = None
-        self.voice_cache: Dict[str, Any] = {}  # Cache for loaded voice packs
-        self.voice_cache_lock = threading.Lock()  # Thread safety for cache
-
-    def initialize_model(self, voice: str = "af_heart"):
-        """Initialize Kokoro TTS model"""
-        try:
-            # Ensure model and voice files exist
-            model_path, voice_path = ensure_model_and_voices(voice)
+        self.model_lock = threading.Lock()
+        self.request_queue = queue.Queue()
+        self.synthesis_thread = None
+        
+        # Thread pool for handling synthesis requests
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
+        
+        # TCP socket for voice server communication
+        self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Set up signal handlers
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
+        signal.signal(signal.SIGINT, self.handle_shutdown)
+        
+    # Add to model_server.py initialization
+    def _initialize(self):
+        """Custom initialization."""
+        # Ensure socket directory exists
+        socket_dir = os.path.dirname(SOCKET_BASE_PATH)
+        os.makedirs(socket_dir, exist_ok=True)
+        
+        # Initialize model if not already done
+        if self.model is None:
+            self.initialize_model()
             
-            # Load model
+    def initialize_model(self):
+        """Initialize the central KModel instance."""
+        from kokoro import KPipeline
+        import torch
+        from src.fetchers import ensure_model_and_voices  # Explicit import
+
+        try:
+            # Ensure model and voices exist (using default voice)
+            logger.info("Checking for model and voice files...")
+            model_path, voices_json_path = ensure_model_and_voices("af_bella")
+            
+            # Initialize pipeline with model
             use_gpu = torch.cuda.is_available()
             device = 'cuda' if use_gpu else 'cpu'
-            self.model = KModel().to(device).eval()
+            logger.info(f"Initializing KPipeline on {device}")
             
-            # Initialize pipeline
-            self.pipeline = KPipeline(lang_code='a', model=False)
+            # Initialize the pipeline with correct parameters
+            self.pipeline = KPipeline(lang_code='a')
+            self.model = self.pipeline.model
             
-            # Add custom pronunciations
-            self.pipeline.g2p.lexicon.golds['kokoro'] = 'kˈOkəɹO'
-            
-            # Pre-load default voice
-            self._load_voice(voice)
-            
-            logger.info("Kokoro model and pipeline initialized successfully")
+            # Move model to appropriate device
+            if self.model is not None:
+                self.model = self.model.to(device).eval()
+                logger.info(f"Model initialization complete on {device}")
+            else:
+                logger.error("Failed to initialize model: model is None")
+                raise RuntimeError("Model initialization failed - model is None")
             
         except Exception as e:
-            logger.error(f"Failed to initialize Kokoro model: {e}")
+            logger.error(f"Failed to initialize model: {e}")
             raise
-
-    def _load_voice(self, voice: str) -> Any:
-        """Load a voice pack with caching"""
-        with self.voice_cache_lock:
-            if voice in self.voice_cache:
-                logger.debug(f"Using cached voice pack for {voice}")
-                return self.voice_cache[voice]
-            
-            logger.debug(f"Loading voice pack for {voice}")
-            pack = self.pipeline.load_voice(voice)
-            self.voice_cache[voice] = pack
-            return pack
-
-    def process_request(self, request: dict) -> dict:
-        """Process client request"""
-        try:
-            # Handle exit command
-            if request.get("command") == "exit":
-                self.running = False
-                return {"status": "success", "message": "Server shutting down"}
-
-            # Handle ping command
-            if request.get("command") == "ping":
-                return {"status": "success", "message": "pong"}
-
-            # Handle TTS request
-            if "text" in request:
-                voice = request["voice"]
-                speed = request.get("speed", 1.0)
                 
-                try:
-                    # Get voice pack from cache
-                    pack = self._load_voice(voice)
-                    
-                    # Generate audio
-                    for _, ps, _ in self.pipeline(request["text"], voice, speed):
-                        ref_s = pack[len(ps)-1]
-                        try:
-                            audio = self.model(ps, ref_s, speed)
-                            audio_data = audio.cpu().numpy()
-                            
-                            return {
-                                "status": "success",
-                                "samples": audio_data.tolist(),
-                                "sample_rate": 24000
-                            }
-                        except Exception as e:
-                            if torch.cuda.is_available():
-                                logger.warning("GPU error, falling back to CPU")
-                                self.model = self.model.to('cpu')
-                                audio = self.model(ps, ref_s, speed)
-                                audio_data = audio.cpu().numpy()
-                                return {
-                                    "status": "success",
-                                    "samples": audio_data.tolist(),
-                                    "sample_rate": 24000
-                                }
-                            raise
-                            
-                except Exception as e:
-                    raise RuntimeError(f"TTS generation failed: {e}")
-
-            raise ValueError("Invalid request")
-
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": str(e)
-            }
-
-    def handle_shutdown(self):
-        """Handle shutdown signal"""
-        logger.info("Shutdown signal received")
-        self.running = False
-
-    def cleanup(self):
-        """Clean up resources"""
-        logger.info("Cleaning up resources")
-        # Clear voice cache
-        with self.voice_cache_lock:
-            self.voice_cache.clear()
+    def start(self):
+        """Start the model server."""
         try:
-            self.socket.close()
+            logger.info("Starting model server")
+            # Initialize model if not already done
+            if self.model is None:
+                self.initialize_model()
+                if self.model is None:
+                    raise RuntimeError("Model initialization failed")
+            
+            # Start synthesis worker thread if not running
+            if self.synthesis_thread is None:
+                self.synthesis_thread = threading.Thread(target=self.synthesis_worker)
+                self.synthesis_thread.daemon = True
+                self.synthesis_thread.start()
+            
+            # Bind TCP socket if not already bound
+            try:
+                self.tcp_sock.bind((MODEL_SERVER_HOST, MODEL_SERVER_PORT))
+                self.tcp_sock.listen(5)
+                self.tcp_sock.settimeout(1.0)  # Allow for clean shutdown
+                logger.info(f"Model server listening on {MODEL_SERVER_HOST}:{MODEL_SERVER_PORT}")
+            except OSError as e:
+                if e.errno == 98:  # Address already in use
+                    logger.warning("Socket already bound, continuing...")
+                else:
+                    raise
+            
+            # Main server loop
+            while self.running:
+                try:
+                    conn, addr = self.tcp_sock.accept()
+                    logger.info(f"Accepted connection from {addr}")
+                    self.thread_pool.submit(self.handle_client, conn)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Accept error: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+            raise
+        finally:
+            if not self.running:
+                self.cleanup()
+
+    def handle_client(self, conn: socket.socket):
+        """Handle client connection and process requests."""
+        try:
+            # Receive data using standard protocol
+            raw_data = conn.recv(8192)
+            logger.debug(f"Received {len(raw_data)} bytes")
+            
+            try:
+                # Decode the bytes to string
+                data = raw_data.decode('utf-8')
+                logger.debug(f"Decoded data: {data}")
+            except UnicodeDecodeError as e:
+                logger.error(f"Decoding error: {e}")
+                return
+            
+            try:
+                # Try to parse as JSON directly
+                request = json.loads(data)
+                logger.debug(f"Parsed request: {request}")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing error: {e}")
+                logger.error(f"Problematic data: {data}")
+                return
+                    
+            # Process request
+            if "command" in request and request["command"] == "exit":
+                logger.info("Received exit command")
+                self.running = False
+                response = {"status": "shutdown_initiated"}
+                conn.sendall(json.dumps(response).encode())
+                return
+                
+            # Handle synthesis request
+            if "text" in request:
+                logger.info(f"Queueing synthesis request: {request['text'][:30]}...")
+                self.request_queue.put((request, conn))
+                    
+        except Exception as e:
+            logger.error(f"Error handling client request: {e}")
+        finally:
+            # Don't close the connection here - it will be closed after sending the response
+            pass
+    
+    def synthesis_worker(self):
+        """Worker thread that processes synthesis requests."""
+        while self.running:
+            try:
+                # Get next request from queue with timeout
+                try:
+                    request, conn = self.request_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                    
+                # Process synthesis request
+                try:
+                    with self.model_lock:
+                        if self.pipeline is None:
+                            error_response = {
+                                "status": "error",
+                                "error": "Pipeline not initialized"
+                            }
+                            conn.sendall(json.dumps(error_response).encode())
+                            continue
+                            
+                        # Set default values if not provided
+                        voice = request.get("voice", "af_bella")
+                        speed = request.get("speed", 1.0)
+                        
+                        logger.info(f"Synthesizing text with voice {voice} at speed {speed}")
+                        
+                        # Use pipeline to generate audio
+                        audio_chunks = []
+                        
+                        # Process text through pipeline
+                        try:
+                            for graphemes, phonemes, audio in self.pipeline(
+                                text=request["text"],
+                                voice=voice,
+                                speed=speed
+                            ):
+                                logger.debug(f"Generated audio chunk: {len(audio)} samples")
+                                audio_chunks.append(audio)
+                                
+                            if not audio_chunks:
+                                raise ValueError("No audio chunks generated")
+                                
+                            # Concatenate all chunks
+                            final_audio = np.concatenate(audio_chunks)
+                            
+                            # Play the audio directly
+                            import sounddevice as sd
+                            sd.play(final_audio, 24000)
+                            
+                            # Send simplified response (without the full audio data)
+                            response = {
+                                "status": "success",
+                                "message": "Audio is playing",
+                                "audio_length": len(final_audio)
+                            }
+                            
+                            logger.info(f"Playing audio: {len(final_audio)} samples")
+                            conn.sendall(json.dumps(response).encode())
+                            
+                        except Exception as e:
+                            logger.error(f"Pipeline execution error: {e}")
+                            error_response = {
+                                "status": "error",
+                                "error": f"Pipeline execution error: {str(e)}"
+                            }
+                            conn.sendall(json.dumps(error_response).encode())
+                        
+                except Exception as e:
+                    logger.error(f"Synthesis error: {e}")
+                    error_response = {
+                        "status": "error",
+                        "error": str(e)
+                    }
+                    try:
+                        conn.sendall(json.dumps(error_response).encode())
+                    except:
+                        pass
+                    
+                finally:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                        
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+                try:
+                    conn.close()
+                except:
+                    pass
+                                
+    def handle_shutdown(self, signo, frame):
+        """Handle shutdown signal."""
+        logger.info(f"Received signal {signo}, initiating shutdown")
+        self.running = False
+        
+    def cleanup(self):
+        """Clean up resources."""
+        logger.info("Cleaning up resources")
+        self.running = False
+        
+        # Stop synthesis thread
+        if self.synthesis_thread and self.synthesis_thread.is_alive():
+            self.synthesis_thread.join(timeout=5)
+            
+        # Clean up thread pool
+        self.thread_pool.shutdown(wait=True)
+        
+        # Close socket
+        try:
+            self.tcp_sock.close()
         except:
             pass
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--script-dir", required=True, type=Path)
-    parser.add_argument("--log-level", default="INFO",
-                      choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    args = parser.parse_args()
-
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('/tmp/tts_daemon.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-
-    try:
-        logger.info("Starting model server...")
-        server = ModelServer(args.script_dir)
-        server.start()
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        server.handle_shutdown()
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
-    finally:
-        try:
-            server.cleanup()
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-        sys.exit(0)
+        
+        # Clear model
+        self.model = None
+        self.pipeline = None
