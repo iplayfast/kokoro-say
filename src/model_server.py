@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from src.constants import (
-    MODEL_PATH,
     MODEL_SERVER_HOST,
     MODEL_SERVER_PORT,
     VOICES_CONFIG_PATH,
@@ -25,6 +24,7 @@ from src.constants import (
 )
 
 from src.socket_protocol import SocketProtocol
+from src.fetchers import ensure_voice
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +91,10 @@ class ModelServer:
         """Initialize the central KModel instance."""
         from kokoro import KPipeline
         import torch
-        from src.fetchers import ensure_model_and_voices
 
         try:
-            # Ensure model and voices exist (using default voice)
-            logger.info("Checking for model and voice files...")
-            model_path, voices_json_path = ensure_model_and_voices("af_bella")
+            # Assume model has been installed properly and is available
+            logger.info("Initializing KModel...")
             
             # Initialize pipeline with model
             use_gpu = torch.cuda.is_available()
@@ -366,6 +364,7 @@ except Exception as e:
         finally:
             if not self.running:
                 self.cleanup()
+                
     def handle_client(self, conn: socket.socket):
         """Handle client connection and process requests by routing to voice servers."""
         try:
@@ -477,6 +476,9 @@ except Exception as e:
                     voice = request.get("voice", "af_bella")
                     speed = request.get("speed", 1.0)
                     text = request.get("text", "")
+                    
+                    # Ensure voice file exists
+                    ensure_voice(voice)
                     
                     logger.info(f"Worker {thread_id} processing text with voice {voice} at speed {speed}")
                     

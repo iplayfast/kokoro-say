@@ -2,6 +2,7 @@
 
 """
 Fetcher classes for downloading and managing voice models from Hugging Face.
+Modified to remove model download functionality.
 """
 
 import os
@@ -18,9 +19,7 @@ from src.constants import (
     CACHE_DIR,
     VOICES_DIR,
     MODEL_DIR,
-    MODEL_PATH,
     VOICES_CONFIG_PATH,
-    MODEL_URL,
     VOICES_BASE_URL,
     SPEAKER_EMBEDDING_DIM,
     SPEAKER_EMBEDDING_CHANNELS
@@ -288,182 +287,27 @@ class VoiceFetcher:
             logger.error(f"Failed to download voice {voice}: {str(e)}")
             raise RuntimeError(f"Failed to download voice {voice}: {str(e)}")
 
-class ModelFetcher:
-    def __init__(self):
-        self.model_url = MODEL_URL
-        self.model_dir = MODEL_DIR
-    
-    def _create_voices_json(self, path: Path) -> None:
-        """Create voices.json configuration file"""
-        # Create base configuration
-        config = {
-            "speakers": {},
-            "multispeaker": True,
-            "speaker_embedding_channels": SPEAKER_EMBEDDING_CHANNELS,
-            "speaker_embeddings_path": None,
-            "speaker_embedding_dim": SPEAKER_EMBEDDING_DIM
-        }
-        
-        # Add configurations for all known voices
-        voice_fetcher = VoiceFetcher()
-        for voice in voice_fetcher.get_available_voices():
-            # Determine language based on prefix
-            prefix = voice[:2]  # af, am, bf, bm, etc.
-            
-            # Determine if British
-            is_british = prefix in ("bf", "bm")
-            
-            # Determine gender
-            is_male = prefix[1] == "m"
-            
-            # Determine language code based on first letter of prefix
-            language_map = {
-                "a": "en-us",    # American English
-                "b": "en-gb",    # British English
-                "j": "ja",       # Japanese
-                "z": "cmn",      # Mandarin Chinese
-                "e": "es",       # Spanish
-                "f": "fr-fr",    # French
-                "h": "hi",       # Hindi
-                "i": "it",       # Italian
-                "p": "pt-br"     # Brazilian Portuguese
-            }
-            
-            language = language_map.get(prefix[0], "en-us")
-            
-            config["speakers"][voice] = {
-                "name": voice,
-                "language": language,
-                "gender": "male" if is_male else "female",
-                "description": f"Voice model for {voice}",
-                "embedding_path": str(voice_fetcher.voices_dir / f"{voice}.pt"),
-                "symbols": None
-            }
-        
-        # Write configuration file with explicit encoding
-        with path.open('w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        
-        # Verify the file was written correctly
-        try:
-            with path.open('r', encoding='utf-8') as f:
-                verification = json.load(f)
-            if len(verification["speakers"]) != len(config["speakers"]):
-                raise ValueError("Configuration verification failed - speaker count mismatch")
-            logger.info(f"Successfully created and verified voices configuration at {path}")
-        except Exception as e:
-            logger.error(f"Failed to verify voices configuration: {e}")
-            if path.exists():
-                path.unlink()
-            raise RuntimeError(f"Failed to create valid voices configuration: {e}")
-    
-    def fetch_model(self) -> Tuple[Path, Path]:
-        """
-        Fetch model and create voices.json if needed
-        
-        Returns:
-            Tuple[Path, Path]: Paths to the model file and voices.json file
-        """
-        self.model_dir.mkdir(parents=True, exist_ok=True)
-        model_path = MODEL_PATH
-        voices_json_path = VOICES_CONFIG_PATH
-
-        # Simulate download for development/testing
-        if os.environ.get("KOKORO_DEV_MODE") == "1":
-            print(f"\nDEV MODE: Simulating download of Kokoro model...")
-            # Create empty file for testing
-            with model_path.open('wb') as f:
-                f.write(b"SIMULATED MODEL FILE")
-            time.sleep(1)  # Simulate download time
-        # Download model if needed
-        elif not model_path.exists():
-            print(f"\nDownloading Kokoro model...")
-            try:
-                response = requests.get(self.model_url, stream=True, timeout=30)
-                response.raise_for_status()
-                
-                total_size = int(response.headers.get('content-length', 0))
-                with model_path.open('wb') as f:
-                    if total_size == 0:
-                        f.write(response.content)
-                    else:
-                        downloaded = 0
-                        for data in response.iter_content(chunk_size=8192):
-                            downloaded += len(data)
-                            f.write(data)
-                            done = int(50 * downloaded / total_size)
-                            sys.stdout.write(f"\rModel: |{'█' * done}{'-' * (50-done)}| {int(100 * downloaded / total_size)}%")
-                            sys.stdout.flush()
-                        print()
-                        
-            except Exception as e:
-                if model_path.exists():
-                    model_path.unlink()
-                logger.error(f"Failed to download model: {str(e)}")
-                raise RuntimeError(f"Failed to download model: {str(e)}")
-
-        # Create voices.json if needed
-        if not voices_json_path.exists():
-            print(f"Creating voices configuration...")
-            self._create_voices_json(voices_json_path)
-        else:
-            # Verify existing voices.json is valid and update with new voices if needed
-            try:
-                with voices_json_path.open('r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    
-                # Check if config has speakers
-                if "speakers" not in config or not config["speakers"]:
-                    logger.warning("Existing voices.json is invalid, recreating")
-                    self._create_voices_json(voices_json_path)
-                else:
-                    # Get all available voices
-                    voice_fetcher = VoiceFetcher()
-                    available_voices = voice_fetcher.get_available_voices()
-                    
-                    # Check if any new voices are missing from the config
-                    existing_voices = set(config["speakers"].keys())
-                    missing_voices = set(available_voices) - existing_voices
-                    
-                    if missing_voices:
-                        logger.info(f"Updating voices.json with {len(missing_voices)} new voices")
-                        self._create_voices_json(voices_json_path)
-                    
-            except Exception as e:
-                logger.warning(f"Existing voices.json is invalid, recreating: {e}")
-                self._create_voices_json(voices_json_path)
-        
-        return model_path, voices_json_path
-
-def ensure_model_and_voices(voice: str) -> Tuple[Path, Path]:
+def ensure_voice(voice: str) -> Path:
     """
-    Ensure both model and specified voice exist
+    Ensure the specified voice exists
     
     Args:
         voice: Name of the voice to ensure exists
         
     Returns:
-        tuple[Path, Path]: Paths to the model and voice files
+        Path: Path to the voice file
     """
     try:
-        # First get model and voices.json
-        model_fetcher = ModelFetcher()
-        model_path, voices_json_path = model_fetcher.fetch_model()
-        
-        # Then get the specific voice file
+        # Download/verify the voice file
         voice_fetcher = VoiceFetcher()
         voice_path = voice_fetcher.fetch_voice(voice)
         
-        # Verify both files exist
-        if not model_path.exists():
-            raise RuntimeError(f"Model file not found at {model_path}")
-        if not voices_json_path.exists():
-            raise RuntimeError(f"Voices configuration not found at {voices_json_path}")
+        # Verify the file exists
         if not voice_path.exists():
             raise RuntimeError(f"Voice file not found at {voice_path}")
             
-        return model_path, voices_json_path
+        return voice_path
         
     except Exception as e:
-        logger.error(f"Setup failed: {e}")
-        raise RuntimeError(f"Failed to ensure model and voices: {e}")
+        logger.error(f"Voice setup failed: {e}")
+        raise RuntimeError(f"Failed to ensure voice exists: {e}")

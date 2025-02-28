@@ -113,7 +113,8 @@ THREAD_POOL_SIZE = 4
 #
 
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-DEFAULT_LOG_LEVEL = 'DEBUG'
+# log leves are 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+DEFAULT_LOG_LEVEL = 'ERROR'
 
 #
 # Model Parameters
