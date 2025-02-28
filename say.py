@@ -38,7 +38,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Improved model server launch function for say.py
 
 def ensure_model_server() -> bool:
     """Ensure model server is running, start it if needed with better error handling."""
@@ -78,12 +77,13 @@ logging.basicConfig(
     level='DEBUG',
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/tmp/kokoro_launch.log'),
+        logging.FileHandler('{constants.LOG_FILE}'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 
 logger = logging.getLogger("launcher")
+logger.info("==== MODEL SERVER LAUNCHER STARTED ====")
 
 # Add project directory to the Python path
 project_dir = {repr(current_dir)}
@@ -141,7 +141,7 @@ except Exception as e:
                 logger.error(f"Server process exited with code {process.returncode}")
                 logger.error(f"STDOUT: {stdout.decode()}")
                 logger.error(f"STDERR: {stderr.decode()}")
-                logger.error(f"Check /tmp/kokoro_launch.log for more details")
+                logger.error(f"Check {constants.LOG_FILE} for more details")
                 os.unlink(temp_script)  # Clean up temp file
                 return False
             
@@ -152,7 +152,7 @@ except Exception as e:
             
         # If we get here, timeout occurred
         logger.error("Timeout waiting for model server to start")
-        logger.error("Check /tmp/kokoro_launch.log for error details")
+        logger.error(f"Check {constants.LOG_FILE} for error details")
         os.unlink(temp_script)  # Clean up temp file
         raise RuntimeError("Timeout waiting for model server to start")
         
@@ -229,29 +229,150 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file:
         except:
             pass
                         
+
 def kill_server():
-    """Send exit command to model server."""
+    """Send exit command to model server and ensure processes are terminated."""
     try:
-        with socket.create_connection(
-            (constants.MODEL_SERVER_HOST, constants.MODEL_SERVER_PORT),
-            timeout=constants.SERVER_TIMEOUT
-        ) as sock:
-            request = {"command": "exit"}
-            sock.sendall(json.dumps(request).encode())
+        # Try to connect to the model server
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(constants.SERVER_TIMEOUT)
+            sock.connect((constants.MODEL_SERVER_HOST, constants.MODEL_SERVER_PORT))
+        except ConnectionRefusedError:
+            logger.info("Model server not running. Nothing to kill.")
+            return True
+        except Exception as e:
+            logger.error(f"Could not connect to model server: {e}")
+            # Continue with forceful kill as fallback
+            return force_kill_processes()
             
-            # Wait for confirmation
+        # Send properly formatted exit command
+        try:
+            from src.socket_protocol import SocketProtocol
+            request = {"command": "exit"}
+            SocketProtocol.send_json(sock, request)
+            
+            # Wait for confirmation with proper error handling
             try:
                 sock.settimeout(5)
-                response = sock.recv(1024)
-                logger.info(f"Server shutdown response: {response.decode()}")
-            except:
-                pass
+                response = SocketProtocol.receive_json(sock)
+                logger.info(f"Server shutdown response: {response}")
                 
-        logger.info("Kill command sent to model server")
-        return True
+                if response.get("status") != "shutdown_initiated":
+                    logger.warning(f"Unexpected response: {response}")
+            except Exception as e:
+                logger.warning(f"Error receiving shutdown confirmation: {e}")
+        finally:
+            sock.close()
+            
+        # Wait for processes to terminate
+        logger.info("Kill command sent to model server, waiting for shutdown...")
+        
+        # Give processes time to terminate gracefully
+        for i in range(6):  # Wait up to 3 seconds
+            time.sleep(0.5)
+            if not check_processes_running():
+                logger.info("All processes terminated successfully")
+                return True
+        
+        # If processes are still running, force kill them
+        logger.warning("Processes still running after graceful shutdown attempt, forcing termination...")
+        return force_kill_processes()
+        
     except Exception as e:
         logger.error(f"Failed to send kill command: {e}")
+        # Try forceful kill as fallback
+        return force_kill_processes()
+
+def check_processes_running():
+    """Check if any kokoro TTS processes are still running."""
+    try:
+        import subprocess
+        import re
+        
+        # Get list of running python processes
+        output = subprocess.check_output(["ps", "aux"], universal_newlines=True)
+        
+        # Find model server and voice server processes
+        model_pattern = re.compile(r'python.*kokoro.*model_server|tmpxz.*\.py')
+        voice_pattern = re.compile(r'python.*voice_server')
+        
+        model_running = any(model_pattern.search(line) for line in output.splitlines())
+        voice_running = any(voice_pattern.search(line) for line in output.splitlines())
+        
+        return model_running or voice_running
+    except Exception as e:
+        logger.error(f"Error checking for running processes: {e}")
+        return False  # Assume no processes running to avoid false positives
+
+def force_kill_processes():
+    """Forcefully terminate all kokoro TTS processes."""
+    try:
+        import subprocess
+        import signal
+        import os
+        
+        logger.info("Forcefully terminating all kokoro TTS processes...")
+        
+        # Find all related processes
+        try:
+            # Get model server PID(s)
+            output = subprocess.check_output(
+                ["pgrep", "-f", "python.*kokoro.*model_server|tmpxz.*\\.py"], 
+                universal_newlines=True
+            ).strip()
+            pids = output.split('\n') if output else []
+            
+            # Kill model server process(es)
+            for pid in pids:
+                if pid.strip():
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                        logger.info(f"Killed model server process {pid}")
+                    except Exception as e:
+                        logger.error(f"Error killing model server process {pid}: {e}")
+            
+            # Get voice server PID(s)
+            output = subprocess.check_output(
+                ["pgrep", "-f", "python.*voice_server"], 
+                universal_newlines=True
+            ).strip()
+            pids = output.split('\n') if output else []
+            
+            # Kill voice server process(es)
+            for pid in pids:
+                if pid.strip():
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                        logger.info(f"Killed voice server process {pid}")
+                    except Exception as e:
+                        logger.error(f"Error killing voice server process {pid}: {e}")
+        except subprocess.CalledProcessError:
+            # No processes found
+            pass
+        
+        # Clean up socket files
+        socket_pattern = f"{constants.SOCKET_BASE_PATH}_*"
+        import glob
+        for socket_file in glob.glob(socket_pattern):
+            try:
+                os.unlink(socket_file)
+                logger.info(f"Removed socket file: {socket_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove socket file {socket_file}: {e}")
+        
+        # Verify all processes are terminated
+        if not check_processes_running():
+            logger.info("All processes successfully terminated")
+            return True
+        else:
+            logger.error("Failed to terminate all processes")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error in force_kill_processes: {e}")
         return False
+    
 def main():
     parser = argparse.ArgumentParser(
         description="Text-to-Speech using Kokoro with voice persistence"
