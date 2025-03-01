@@ -23,8 +23,8 @@ A high-performance text-to-speech system built around the Kokoro TTS engine. Thi
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/kokoro-tts.git
-   cd kokoro-tts
+   git clone https://github.com/iplayfast/kokoro-say.git
+   cd kokoro-say
    ```
 2. create an environment:
    ```bash

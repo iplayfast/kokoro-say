@@ -1,0 +1,84 @@
+flowchart TD
+    classDef client fill:#d4edda,stroke:#155724,stroke-width:2px
+    classDef server fill:#cce5ff,stroke:#004085,stroke-width:2px
+    classDef voice fill:#fff3cd,stroke:#856404,stroke-width:2px
+    classDef audio fill:#f8d7da,stroke:#721c24,stroke-width:2px
+    classDef file fill:#e2e3e5,stroke:#383d41,stroke-width:2px
+    
+    User([User])
+    SayClient[say.py\nCommand-line Client]
+    ApiServer[api.py\nAPI Server]
+    ModelServer[model_server.py\nCentral Model Server]
+    VoiceServerA[Voice Server A\naf_bella + en-us]
+    VoiceServerB[Voice Server B\naf_michael + en-us]
+    VoiceServerC[Voice Server C\nbf_emma + en-gb]
+    SpeakerOutput([Speaker Output])
+    WavFile([WAV File])
+    Model[(TTS Model)]
+    Server[/Voice Server Socket Files\n/tmp/tts_socket_*/]
+    
+    User -->|"Uses (exits immediately)"| SayClient
+    User -->|"HTTP Request\n(Web integration)"| ApiServer
+    SayClient -->|"1. Send text + voice\nvia socket"| ModelServer
+    ApiServer -->|"1. Forward request\nvia socket"| ModelServer
+    
+    ModelServer -->|"2a. Create if needed"| VoiceServerA
+    ModelServer -->|"2a. Create if needed"| VoiceServerB
+    ModelServer -->|"2a. Create if needed"| VoiceServerC
+    
+    ModelServer -->|"2b. Route request"| VoiceServerA
+    ModelServer -->|"2b. Route request"| VoiceServerB
+    ModelServer -->|"2b. Route request"| VoiceServerC
+    
+    VoiceServerA -->|"3a. Request synthesis"| ModelServer
+    VoiceServerB -->|"3a. Request synthesis"| ModelServer
+    VoiceServerC -->|"3a. Request synthesis"| ModelServer
+    
+    ModelServer -->|"3b. Return audio data"| VoiceServerA
+    ModelServer -->|"3b. Return audio data"| VoiceServerB
+    ModelServer -->|"3b. Return audio data"| VoiceServerC
+    
+    VoiceServerA -->|"4a. Play audio\n(when no --output)"| SpeakerOutput
+    VoiceServerB -->|"4a. Play audio\n(when no --output)"| SpeakerOutput
+    VoiceServerC -->|"4a. Play audio\n(when no --output)"| SpeakerOutput
+    
+    VoiceServerA -->|"4b. Save audio\n(when --output)"| WavFile
+    VoiceServerB -->|"4b. Save audio\n(when --output)"| WavFile
+    VoiceServerC -->|"4b. Save audio\n(when --output)"| WavFile
+    
+    ModelServer -.->|"Maintains single\nshared model instance"| Model
+    ModelServer -.->|"Creates"| Server
+    VoiceServerA -.->|"Connects to"| Server
+    VoiceServerB -.->|"Connects to"| Server
+    VoiceServerC -.->|"Connects to"| Server
+    
+    subgraph ClientLayer["Client Layer"]
+        User
+        SayClient
+        ApiServer
+    end
+    
+    subgraph ServerLayer["Server Layer"]
+        ModelServer
+    end
+    
+    subgraph VoiceLayer["Voice Server Layer"]
+        VoiceServerA
+        VoiceServerB
+        VoiceServerC
+    end
+    
+    subgraph OutputLayer["Output Layer"]
+        SpeakerOutput
+        WavFile
+    end
+    
+    User:::client
+    SayClient:::client
+    ApiServer:::client
+    ModelServer:::server
+    VoiceServerA:::voice
+    VoiceServerB:::voice
+    VoiceServerC:::voice
+    SpeakerOutput:::audio
+    WavFile:::file

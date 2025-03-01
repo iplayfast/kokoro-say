@@ -1,10 +1,12 @@
-# Kokoro TTS Architecture and Usage Guide
+# Kokoro Say Architecture and Usage Guide
 
-This document provides an overview of the Kokoro TTS system architecture, explains how the components interact, and offers examples for common use cases.
+This document provides an overview of the Kokoro Say system architecture, explains how the components interact, and offers examples for common use cases.
 
 ## System Architecture
 
-The Kokoro TTS system uses a distributed architecture with three core components:
+![System Architecture Diagram](say-architecture-diagram.png)
+
+The Kokoro Say system uses a distributed architecture with three core components:
 
 1. **Model Server (model_server.py)**
    - Maintains a single, shared TTS model instance in memory
@@ -35,7 +37,7 @@ The Kokoro TTS system uses a distributed architecture with three core components
 
 2. Model Server ↔ Voice Server:
    - Voice server receives synthesis request from model server
-   - Voice server requests audio synthesis from model server
+   - Voice server requests actual audio synthesis from model server
    - Model server performs synthesis using its centralized model
    - Model server sends generated audio data to voice server
 
@@ -168,10 +170,10 @@ This returns a WAV file that you can play on the client's device.
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Kokoro TTS Demo</title>
+    <title>Kokoro Say Demo</title>
 </head>
 <body>
-    <h1>Kokoro TTS Demo</h1>
+    <h1>Kokoro Say Demo</h1>
     
     <div>
         <label for="text-input">Text to speak:</label>
@@ -428,4 +430,4 @@ Potential extensions for developers:
 
 ---
 
-This guide should help you understand and start using the Kokoro TTS system quickly. For more detailed information, refer to the source code and comments within each file.
+This guide should help you understand and start using the Kokoro Say system quickly. For more detailed information, refer to the source code and comments within each file.

@@ -1,0 +1,55 @@
+flowchart TD
+    classDef component fill:#f9f9f9,stroke:#333,stroke-width:2px
+    classDef client fill:#d4edda,stroke:#155724,stroke-width:2px
+    classDef server fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
+    classDef voice fill:#e2e3e5,stroke:#383d41,stroke-width:2px
+    
+    User([User])
+    WebApp[Flask Web App\nport 5000]:::client
+    CLI[Command-line\nInterface\nsay.py]:::client
+    API[API Server\napi.py\nport 8000]:::server
+    ModelServer[Model Server\nsrc/model_server.py\nport 5000]:::server
+    VoiceServer1[Voice Server 1\nsrc/voice_server.py\nvoice: af_bella]:::voice
+    VoiceServer2[Voice Server 2\nsrc/voice_server.py\nvoice: am_adam]:::voice
+    VoiceServerN[Voice Server N\nsrc/voice_server.py\nvoice: bf_emma]:::voice
+    
+    User -->|Uses| WebApp
+    User -->|Uses| CLI
+    WebApp -->|HTTP Requests| API
+    CLI -->|Socket| ModelServer
+    API -->|Socket| ModelServer
+    ModelServer -->|Creates if needed| VoiceServer1
+    ModelServer -->|Creates if needed| VoiceServer2
+    ModelServer -->|Creates if needed| VoiceServerN
+    
+    subgraph web["Web/API Interface"]
+        WebApp
+        API
+    end
+    
+    subgraph terminal["Terminal Interface"]
+        CLI
+    end
+    
+    subgraph backend["Backend Processing"]
+        ModelServer
+        VoiceServer1
+        VoiceServer2
+        VoiceServerN
+    end
+    
+    %% Data flow for direct speech
+    ModelServer -.->|Routes request| VoiceServer1
+    VoiceServer1 -.->|Requests synthesis| ModelServer
+    ModelServer -.->|Returns audio data| VoiceServer1
+    VoiceServer1 -.->|Plays audio| Speaker([Speaker])
+    
+    %% Data flow for file output
+    ModelServer -.->|Routes request with\noutput_file| VoiceServer2
+    VoiceServer2 -.->|Requests synthesis| ModelServer
+    ModelServer -.->|Returns audio data| VoiceServer2
+    VoiceServer2 -.->|Saves audio| WAV([WAV File])
+    
+    %% Communication details
+    API -->|"/synthesize"| ModelServer
+    API -->|"/synthesize-file"| ModelServer
