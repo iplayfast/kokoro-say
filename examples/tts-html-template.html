@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kokoro TTS Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        textarea, select, input {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 15px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button.secondary {
+            background-color: #2196F3;
+        }
+        button.secondary:hover {
+            background-color: #0b7dda;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .controls {
+            margin-top: 20px;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            margin-top: 20px;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 2s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <h1>Kokoro TTS Demo</h1>
+    
+    <div class="form-group">
+        <label for="text-input">Text to speak:</label>
+        <textarea id="text-input" rows="5" placeholder="Enter text to be spoken...">Hello, welcome to the Kokoro Text-to-Speech system. This is a demonstration of how the system works.</textarea>
+    </div>
+    
+    <div class="form-group">
+        <label for="voice-select">Voice:</label>
+        <select id="voice-select">
+            <option value="af_bella">Bella (Female, US)</option>
+            <option value="af_nicole">Nicole (Female, US)</option>
+            <option value="af_sarah">Sarah (Female, US)</option>
+            <option value="af_sky">Sky (Female, US)</option>
+            <option value="am_adam">Adam (Male, US)</option>
+            <option value="am_michael">Michael (Male, US)</option>
+            <option value="bf_emma">Emma (Female, UK)</option>
+            <option value="bf_isabella">Isabella (Female, UK)</option>
+            <option value="bm_george">George (Male, UK)</option>
+            <option value="bm_lewis">Lewis (Male, UK)</option>
+        </select>
+    </div>
+    
+    <div class="form-group">
+        <label for="language-select">Language:</label>
+        <select id="language-select">
+            <option value="en-us">English (US)</option>
+            <option value="en-gb">English (UK)</option>
+            <option value="fr-fr">French</option>
+        </select>
+    </div>
+    
+    <div class="form-group">
+        <label for="speed-input">Speed (0.5 - 2.0):</label>
+        <input type="number" id="speed-input" min="0.5" max="2.0" step="0.1" value="1.0">
+    </div>
+    
+    <div class="button-group">
+        <button id="speak-button">Speak (Client-side)</button>
+        <button id="download-button" class="secondary">Download WAV</button>
+        <button id="speak-server-button" class="secondary">Speak (Server-side)</button>
+    </div>
+    
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>Generating speech...</p>
+    </div>
+    
+    <div class="controls">
+        <label for="audio-player">Playback:</label>
+        <audio id="audio-player" controls style="width: 100%;"></audio>
+    </div>
+    
+    <div id="status-message" class="status" style="display: none;"></div>
+    
+    <script>
+        // Initialize UI
+        document.addEventListener('DOMContentLoaded', function() {
+            // Fetch available voices from the server
+            fetchVoices();
+            
+            // Fetch available languages from the server
+            fetchLanguages();
+            
+            // Set up event listeners
+            document.getElementById('speak-button').addEventListener('click', synthesizeSpeech);
+            document.getElementById('download-button').addEventListener('click', downloadSpeech);
+            document.getElementById('speak-server-button').addEventListener('click', synthesizeSpeechServer);
+        });
+        
+        // Fetch available voices
+        async function fetchVoices() {
+            try {
+                const response = await fetch('/api/voices');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const voiceData = await response.json();
+                updateVoiceSelect(voiceData);
+            } catch (error) {
+                console.error('Error fetching voices:', error);
+                showStatus('Error fetching voices. Check console for details.', 'error');
+            }
+        }
+        
+        // Fetch available languages
+        async function fetchLanguages() {
+            try {
+                const response = await fetch('/api/languages');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const languageData = await response.json();
+                updateLanguageSelect(languageData);
+            } catch (error) {
+                console.error('Error fetching languages:', error);
+                showStatus('Error fetching languages. Check console for details.', 'error');
+            }
+        }
+        
+        // Update voice select dropdown
+        function updateVoiceSelect(voiceData) {
+            const voiceSelect = document.getElementById('voice-select');
+            
+            // Clear existing options
+            voiceSelect.innerHTML = '';
+            
+            // Add American voices
+            if (voiceData.american && voiceData.american.length > 0) {
+                const americanGroup = document.createElement('optgroup');
+                americanGroup.label = 'American English';
+                
+                for (const voice in voiceData.american) {
+                    const info = voiceData.american[voice];
+                    const option = document.createElement('option');
+                    option.value = voice;
+                    option.textContent = `${info.name} (${info.gender})`;
+                    americanGroup.appendChild(option);
+                }
+                
+                voiceSelect.appendChild(americanGroup);
+            }
+            
+            // Add British voices
+            if (voiceData.british && voiceData.british.length > 0) {
+                const britishGroup = document.createElement('optgroup');
+                britishGroup.label = 'British English';
+                
+                for (const voice in voiceData.british) {
+                    const info = voiceData.british[voice];
+                    const option = document.createElement('option');
+                    option.value = voice;
+                    option.textContent = `${info.name} (${info.gender})`;
+                    britishGroup.appendChild(option);
+                }
+                
+                voiceSelect.appendChild(britishGroup);
+            }
+        }
+        
+        // Update language select dropdown
+        function updateLanguageSelect(languageData) {
+            const languageSelect = document.getElementById('language-select');
+            
+            // Clear existing options
+            languageSelect.innerHTML = '';
+            
+            // Add languages
+            for (const code in languageData) {
+                const option = document.createElement('option');
+                option.value = code;
+                option.textContent = languageData[code];
+                languageSelect.appendChild(option);
+            }
+        }
+        
+        // Synthesize speech (client-side playback)
+        async function synthesizeSpeech() {
+            const text = document.getElementById('text-input').value;
+            const voice = document.getElementById('voice-select').value;
+            const language = document.getElementById('language-select').value;
+            const speed = document.getElementById('speed-input').value;
+            
+            if (!text.trim()) {
+                showStatus('Please enter some text to speak.', 'error');
+                return;
+            }
+            
+            // Show loading indicator
+            document.getElementById('loading').style.display = 'block';
+            
+            try {
+                const response = await fetch('/api/speak', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        text: text,
+                        voice: voice, 
+                        language: language,
+                        speed: speed
+                    })
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+                }
+                
+                const audioBlob = await response.blob();
+                const audioUrl = URL.createObjectURL(audioBlob);
+                
+                const audioElement = document.getElementById('audio-
