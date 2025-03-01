@@ -4,7 +4,7 @@ This document provides an overview of the Kokoro Say system architecture, explai
 
 ## System Architecture
 
-![System Architecture Diagram](say-architecture-diagram.png)
+![System Architecture Diagram](say-architecture-diagram.mermaid)
 
 The Kokoro Say system uses a distributed architecture with three core components:
 
