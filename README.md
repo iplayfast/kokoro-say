@@ -26,7 +26,11 @@ A high-performance text-to-speech system built around the Kokoro TTS engine. Thi
    git clone https://github.com/yourusername/kokoro-tts.git
    cd kokoro-tts
    ```
-
+2. create an environment:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate
+   ```    
 2. Install the dependencies:
    ```bash
    pip install -r requirements.txt
