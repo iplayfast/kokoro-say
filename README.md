@@ -55,7 +55,7 @@ python say.py --speed 1.2 "Hello world"
 python say.py --output hello.wav "Hello world"
 
 # Use pipe input
-echo "Hello world" | python say.py
+echo "Hello world" | python say.py -
 ```
 
 ### Interactive Mode
