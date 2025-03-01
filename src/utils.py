@@ -151,13 +151,13 @@ class VoiceManager:
         """Check if a voice is British"""
         return voice in self.british_voices
 
-    def ensure_voice_available(self, voice: str) -> bool:
+    def ensure_voice_available(self, voice: str) -> Tuple[bool, bool]:
         """
         Ensure a voice is available, downloading if necessary.
         Args:
             voice: Name of the voice to download
         Returns:
-            bool: True if voice is available
+            Tuple[bool, bool]: (is_available, was_downloaded)
         Raises:
             ValueError: If voice cannot be downloaded
         """
@@ -167,17 +167,21 @@ class VoiceManager:
         
         # Check if already downloaded
         voice_path = self.cache_dir / f"{voice}.pt"
-        if voice_path.exists():
-            return True
-            
-        # Need to download the voice
-        from src.fetchers import VoiceFetcher
-        fetcher = VoiceFetcher()
-        try:
-            fetcher.fetch_voice(voice)
-            return True
-        except Exception as e:
-            raise ValueError(f"Failed to download voice {voice}: {str(e)}")
+        was_downloaded = False
+        
+        if not voice_path.exists():
+            # Need to download the voice
+            from src.fetchers import VoiceFetcher
+            fetcher = VoiceFetcher()
+            try:
+                logger.info(f"Downloading voice: {voice}")
+                fetcher.fetch_voice(voice)
+                was_downloaded = True
+                logger.info(f"Voice {voice} downloaded successfully")
+            except Exception as e:
+                raise ValueError(f"Failed to download voice {voice}: {str(e)}")
+        
+        return True, was_downloaded
 
 def play_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
     """Play audio using sounddevice"""

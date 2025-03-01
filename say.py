@@ -165,11 +165,16 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file:
     try:
         # Ensure we have the voice downloaded before sending the request
         voice_manager = VoiceManager()
-        voice_manager.ensure_voice_available(voice)
+        # Track if voice was just downloaded
+        _, voice_downloaded = voice_manager.ensure_voice_available(voice)
+        
+        # Adjust timeout based on whether voice was just downloaded
+        socket_timeout = 60.0 if voice_downloaded else constants.SERVER_TIMEOUT
+        logger.info(f"Using socket timeout of {socket_timeout}s (voice downloaded: {voice_downloaded})")
         
         # Connect to model server
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(constants.SERVER_TIMEOUT)
+        sock.settimeout(socket_timeout)  # Use extended timeout if voice was just downloaded
         sock.connect((constants.MODEL_SERVER_HOST, constants.MODEL_SERVER_PORT))
         
         # Prepare message
@@ -178,7 +183,8 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file:
             "voice": voice,
             "lang": lang,
             "speed": speed,
-            "output_file": output_file  # Add output file path if specified
+            "output_file": output_file,  # Add output file path if specified
+            "first_time_voice": voice_downloaded  # Inform server this is a first-time voice
         }
         
         logger.debug(f"Sending message: {message}")
@@ -188,9 +194,9 @@ def send_text(text: str, voice: str, lang: str, speed: float = 1.0, output_file:
             from src.socket_protocol import SocketProtocol
             SocketProtocol.send_json(sock, message)
             
-            # Receive response using SocketProtocol
+            # Receive response using SocketProtocol with extended timeout
             try:
-                response = SocketProtocol.receive_json(sock)
+                response = SocketProtocol.receive_json(sock, timeout=socket_timeout)
                 
                 if response.get("status") == "success":
                     if output_file:

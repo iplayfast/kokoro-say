@@ -267,14 +267,18 @@ except Exception as e:
         except Exception as e:
             logger.error(f"Failed to start voice server: {e}")
             return False
-            
     def forward_to_voice_server(self, request: Dict, client_conn: socket.socket):
         """Forward synthesis request to the appropriate voice server."""
         voice = request.get("voice", "af_bella")
         lang = request.get("lang", "en-us")
+        first_time_voice = request.get("first_time_voice", False)
         voice_sock = None
         
         try:
+            # Log extended info if this is a first-time voice
+            if first_time_voice:
+                logger.info(f"First-time use of voice {voice}, may need extended initialization time")
+            
             # Ensure voice server is running
             if not self.is_voice_server_running(voice, lang):
                 logger.info(f"Voice server for {voice}/{lang} not running, starting it")
@@ -288,7 +292,7 @@ except Exception as e:
             voice_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             voice_sock.connect(socket_path)
             
-            # Forward the request
+            # Forward the request, including first_time_voice flag
             SocketProtocol.send_json(voice_sock, request)
             
             # Return immediate acknowledgment to client
@@ -297,6 +301,7 @@ except Exception as e:
             SocketProtocol.send_json(client_conn, success_response)
             
         except Exception as e:
+
             logger.error(f"Error forwarding to voice server: {e}")
             try:
                 error_response = {"status": "error", "error": str(e)}
@@ -492,7 +497,71 @@ except Exception as e:
         finally:
             if not self.running:
                 self.cleanup()
+        
+    def forward_to_voice_server_and_wait(self, request: Dict, client_conn: socket.socket) -> bool:
+        """Forward synthesis request to the voice server and wait for file generation to complete."""
+        voice = request.get("voice", "af_bella")
+        lang = request.get("lang", "en-us")
+        output_file = request.get("output_file")
+        voice_sock = None
+        
+        if not output_file:
+            logger.error("Called forward_to_voice_server_and_wait without output_file")
+            return False
+        
+        try:
+            # Ensure voice server is running
+            if not self.is_voice_server_running(voice, lang):
+                logger.info(f"Voice server for {voice}/{lang} not running, starting it")
+                if not self.start_voice_server(voice, lang):
+                    raise RuntimeError(f"Failed to start voice server for {voice}/{lang}")
+                    
+            # Get the socket path
+            socket_path = self.get_voice_server_socket(voice, lang)
+            
+            # Connect to voice server
+            voice_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            voice_sock.connect(socket_path)
+            
+            # Forward the request
+            SocketProtocol.send_json(voice_sock, request)
+            
+            # Wait for completion response from voice server
+            voice_response = SocketProtocol.receive_json(voice_sock, timeout=30.0)
+            logger.info(f"Voice server response: {voice_response}")
+            
+            # Check if file was created
+            max_attempts = 20
+            for attempt in range(max_attempts):
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 100:
+                    logger.info(f"File {output_file} was successfully created")
+                    # Forward success to client
+                    success_response = {
+                        "status": "success", 
+                        "message": f"File created: {output_file}",
+                        "file_size": os.path.getsize(output_file)
+                    }
+                    SocketProtocol.send_json(client_conn, success_response)
+                    return True
                 
+                logger.info(f"Waiting for file ({attempt+1}/{max_attempts})...")
+                time.sleep(0.5)
+                
+            # If we get here, file wasn't created
+            logger.error(f"Timeout waiting for file {output_file} to be created")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error in forward_to_voice_server_and_wait: {e}")
+            return False
+        
+        finally:
+            # Close voice server connection
+            if voice_sock:
+                try:
+                    voice_sock.close()
+                except:
+                    pass
     def handle_client(self, conn: socket.socket):
         """Handle client connection and process requests by routing to voice servers."""
         try:
@@ -515,12 +584,14 @@ except Exception as e:
                 response = {"status": "shutdown_initiated"}
                 SocketProtocol.send_json(conn, response)
                 return
-                
+                    
             # Handle synthesis request
             if "text" in request:
                 # Get voice and language from request
                 voice = request.get("voice", "af_bella")
                 lang = request.get("lang", "en-us")
+                output_file = request.get("output_file")
+                wait_for_completion = request.get("wait_for_completion", False)
                 
                 # Check if this is a direct request from a voice server
                 if request.get("from_voice_server", False):
@@ -530,8 +601,22 @@ except Exception as e:
                 else:
                     # This is from the client - route to voice server
                     logger.info(f"Routing client request for voice {voice} and language {lang}")
-                    self.forward_to_voice_server(request, conn)
                     
+                    if output_file and wait_for_completion:
+                        # For file output with wait_for_completion flag,
+                        # we need to wait until the file is actually generated
+                        success = self.forward_to_voice_server_and_wait(request, conn)
+                        if not success:
+                            logger.error("Forward to voice server with wait failed")
+                            error_response = {"status": "error", "error": "File generation failed"}
+                            try:
+                                SocketProtocol.send_json(conn, error_response)
+                            except:
+                                pass
+                    else:
+                        # Standard forwarding for non-file or non-waiting requests
+                        self.forward_to_voice_server(request, conn)
+                        
         except Exception as e:
             logger.error(f"Error handling client request: {e}")
             try:
@@ -544,7 +629,6 @@ except Exception as e:
                     conn.close()
                 except:
                     pass
-    
     def _split_text(self, text):
         """Split text into reasonable chunks for processing."""
         if not text:
@@ -649,7 +733,7 @@ except Exception as e:
                     needs_primer = self.should_add_audio_primer()
                     original_text = text
                     if needs_primer:
-                        text = ". " + text
+                        text = "  " + text
                         logger.info(f"Added audio primer to text: '{original_text[:30]}...' -> '{text[:30]}...'")
                     else:
                         logger.info(f"No primer needed for text: '{text[:30]}...'")
