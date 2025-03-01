@@ -1,6 +1,6 @@
 # Kokoro TTS System
 
-A high-performance text-to-speech system built around the Kokoro TTS engine. This system maintains persistent TTS models to avoid reloading between invocations, significantly improving efficiency for repeated use.
+A high-performance text-to-speech system built around the Kokoro TTS engine. This system maintains persistent TTS models to avoid reloading between invocations, significantly improving efficiency for repeated use. It also will interrupt a voice if it's the same voice. For example Jack and Jill can both talk at the same time, but Jill can only talk once at a time.
 
 ## Features
 
