@@ -53,8 +53,8 @@ def configure_model_server_logging():
     
     # Get a logger for the model server specifically
     logger = logging.getLogger(__name__)
-    logger.info("==== MODEL SERVER LOGGING INITIALIZED ====")
-    logger.info(f"Logging to {LOG_FILE}")
+    logger.debug("==== MODEL SERVER LOGGING INITIALIZED ====")
+    logger.debug(f"Logging to {LOG_FILE}")
     
     return logger
 

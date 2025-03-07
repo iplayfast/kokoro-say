@@ -163,7 +163,7 @@ def main():
                 print(f"Audio saved to {args.output}")
             else:
                 # Wait briefly for audio to start playing before exiting
-                print("Request sent successfully. Audio synthesis in progress...")            
+                #print("Request sent successfully. Audio synthesis in progress...")            
                 time.sleep(0.2)
             
     except KeyboardInterrupt:
